@@ -4,6 +4,16 @@
   <img src="./gifs/go2_bound.gif" alt="Bound" width="30%">
 </div>
 
+## project goals
+- develop EDMD models for quadruped locomotion
+- dessign Koopman based MPC controllers
+- test controllers on flat terrain first
+
+## TODO
+- collect data for EDMD
+- develop EDMD code using basis functions for SE3
+- check predictions
+- develop KMPC code
 
 ## Overview
 This repo contains a model predictive controller based on the **single rigid body model** and written in **Python**. It comes in two flavours: gradient-based via [acados](https://github.com/acados/acados) or sampling-based via [jax](https://github.com/google/jax). The controller is tested on real robots and is compatible with [Mujoco](https://mujoco.org/). See [the end of this README](https://github.com/iit-DLSLab/Quadruped-PyMPC?tab=readme-ov-file#citing-this-work) if you want to cite this work.
@@ -79,6 +89,40 @@ The first time you run the simulation with acados, in the terminal you will be a
     ```
     pip install -e .
     ```
+
+---
+
+**Troubleshooting Notes (sriram):**
+
+- If you get a CMake error about "Compatibility with CMake < 3.5 has been removed from CMake" when building acados,  
+  open the file  
+  `quadruped_pympc/acados/external/hpipm/CMakeLists.txt`  
+  and change the line  
+  ```
+  cmake_minimum_required(VERSION 2.8.11)
+  ```
+  to  
+  ```
+  cmake_minimum_required(VERSION 3.5)
+  ```
+
+- If you see a warning about CasADi version 3.7.0 not being supported, uninstall it and install version 3.6.7 using conda:
+  ```
+  conda remove casadi
+  conda install -c conda-forge casadi=3.6.7
+  ```
+
+- If you see `segmentation fault core dumped` error when running simulations with acados, use the fix below. This avoids library conflicts between ROS and acados.
+  If you are running pure simulation, set:
+  ```
+  export LD_LIBRARY_PATH=/home/sriramk/Quadruped-PyMPC/quadruped_pympc/acados/lib
+  ```
+  If you are running with ROS/hardware, set (have to check this!!):
+  ```
+  export LD_LIBRARY_PATH=/opt/ros/noetic/lib:/home/sriramk/legged_robot_ws/devel/lib:/home/sriramk/Quadruped-PyMPC/quadruped_pympc/acados/lib
+  ```
+
+---
 
 ## How to run - Simulation
 
