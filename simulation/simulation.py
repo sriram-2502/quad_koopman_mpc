@@ -25,15 +25,15 @@ from quadruped_pympc.quadruped_pympc_wrapper import QuadrupedPyMPC_Wrapper
 def run_simulation(
     qpympc_cfg,
     process=0,
-    num_episodes=500,
-    num_seconds_per_episode=60,
+    num_episodes=10,
+    num_seconds_per_episode=500,
     ref_base_lin_vel=(0.0, 4.0),
     ref_base_ang_vel=(-0.4, 0.4),
     friction_coeff=(0.5, 1.0),
     base_vel_command_type="human",
     seed=0,
     render=True,
-    recording_path: PathLike = None,
+    recording_path: PathLike = "datasets/go1/flat_terrain",
 ):
     np.set_printoptions(precision=3, suppress=True)
     np.random.seed(seed)
@@ -46,7 +46,7 @@ def run_simulation(
     simulation_dt = qpympc_cfg.simulation_params["dt"]
 
     # Save all observables available.
-    state_obs_names = [] #list(QuadrupedEnv.ALL_OBS)  # + list(IMU.ALL_OBS)
+    state_obs_names = list(QuadrupedEnv.ALL_OBS)  # + list(IMU.ALL_OBS)
 
     # Create the quadruped robot environment -----------------------------------------------------------
     env = QuadrupedEnv(
@@ -141,14 +141,15 @@ def run_simulation(
         root_path.mkdir(exist_ok=True)
         dataset_path = (
             root_path
-            / f"{robot_name}/{scene_name}"
-            / f"lin_vel={ref_base_lin_vel} ang_vel={ref_base_ang_vel} friction={friction_coeff}"
-            / f"ep={num_episodes}_steps={int(num_seconds_per_episode // simulation_dt):d}.h5"
+            #/ f"{robot_name}/{scene_name}"
+            #/ f"lin_vel={ref_base_lin_vel} ang_vel={ref_base_ang_vel} friction={friction_coeff}"
+            #/ f"ep={num_episodes}_steps={int(num_seconds_per_episode // simulation_dt):d}.h5"
+            / f"test.h5"
         )
         h5py_writer = H5Writer(
             file_path=dataset_path,
             env=env,
-            extra_obs=None,  # TODO: Make this automatically configured. Not hardcoded
+            extra_obs={"nmpc_GRFs": (4,3)},  # TODO: Make this automatically configured. Not hardcoded
         )
         print(f"\n Recording data to: {dataset_path.absolute()}")
     else:
@@ -254,6 +255,18 @@ def run_simulation(
             base_poz_z_err = ctrl_state["ref_base_height"] - base_pos[2]
             ctrl_state["base_poz_z_err"] = base_poz_z_err
 
+            # Only add nmpc_GRFs to the state dict (if present)
+            # this is the ctrl cmd
+            # for actual GRFs values use 'contact forces' from state observations
+            if "nmpc_GRFs" in ctrl_state:
+                grfs = ctrl_state["nmpc_GRFs"]
+                # Convert LegsAttr to (4, 3) numpy array
+                grfs_array = np.stack([np.asarray(grfs.FL).flatten(),
+                                    np.asarray(grfs.FR).flatten(),
+                                    np.asarray(grfs.RL).flatten(),
+                                    np.asarray(grfs.RR).flatten()], axis=0)
+                state["nmpc_GRFs"] = grfs_array
+
             ep_state_history.append(state)
             ep_time.append(env.simulation_time)
             ep_ctrl_state_history.append(ctrl_state)
@@ -326,7 +339,10 @@ def run_simulation(
         if h5py_writer is not None:  # Save episode trajectory data to disk.
             ep_obs_history = collate_obs(ep_state_history)  # | collate_obs(ep_ctrl_state_history)
             ep_traj_time = np.asarray(ep_time)[:, np.newaxis]
-            h5py_writer.append_trajectory(state_obs_traj=ep_obs_history, time=ep_traj_time)
+            h5py_writer.append_trajectory(
+            state_obs_traj=ep_obs_history,
+            time=ep_traj_time
+            )
 
     env.close()
     if h5py_writer is not None:
