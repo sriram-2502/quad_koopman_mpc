@@ -1,19 +1,41 @@
 from quadruped_pympc import config as cfg
 from simulation import run_simulation
 import pathlib
+import argparse
 
 if __name__ == "__main__":
-    # Set up output directory and file name
-    output_dir = pathlib.Path("datasets/go1/flat_terrain")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_file = output_dir / "experiment1.h5"
+    parser = argparse.ArgumentParser(description="Generate EDMD dataset for quadruped.")
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="../datasets/go1/flat_terrain",
+        help="Directory to save the output dataset (default: datasets/go1/flat_terrain)"
+    )
+    parser.add_argument(
+        "--vel_type",
+        type=str,
+        default="forward+rotate",
+        choices=["forward", "random", "forward+rotate", "human"],
+        help="Type of base velocity command (default: forward+rotate)"
+    )
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=1,
+        help="Number of episodes to generate (default: 1)"
+    )
+    args = parser.parse_args()
 
-    # Run simulation for 100 episodes, stacking all in the same file
+    output_dir = pathlib.Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
     run_simulation(
         qpympc_cfg=cfg,
-        num_episodes=100,
+        num_episodes=args.episodes,
         render=True,
-        recording_path=output_dir  # The simulation script will use this path and always write to 'test.h5'
+        recording_path=output_dir,
+        recording_filename="experimentxx.h5", 
+        base_vel_command_type=args.vel_type
     )
 
     ## to do: add noise to speed and get different types of traj

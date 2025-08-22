@@ -25,15 +25,16 @@ from quadruped_pympc.quadruped_pympc_wrapper import QuadrupedPyMPC_Wrapper
 def run_simulation(
     qpympc_cfg,
     process=0,
-    num_episodes=10,
-    num_seconds_per_episode=500,
-    ref_base_lin_vel=(0.0, 4.0),
+    num_episodes=100,
+    num_seconds_per_episode=60,
+    ref_base_lin_vel=(0.0, 2.0), 
     ref_base_ang_vel=(-0.4, 0.4),
     friction_coeff=(0.5, 1.0),
-    base_vel_command_type="human",
+    base_vel_command_type="forward+rotate",  # "forward", "random", "forward+rotate", "human"
     seed=0,
     render=True,
     recording_path: PathLike = "datasets/go1/flat_terrain",
+    recording_filename: str = "experimentxx.h5",
 ):
     np.set_printoptions(precision=3, suppress=True)
     np.random.seed(seed)
@@ -139,13 +140,7 @@ def run_simulation(
 
         root_path = pathlib.Path(recording_path)
         root_path.mkdir(exist_ok=True)
-        dataset_path = (
-            root_path
-            #/ f"{robot_name}/{scene_name}"
-            #/ f"lin_vel={ref_base_lin_vel} ang_vel={ref_base_ang_vel} friction={friction_coeff}"
-            #/ f"ep={num_episodes}_steps={int(num_seconds_per_episode // simulation_dt):d}.h5"
-            / f"test.h5"
-        )
+        dataset_path = root_path / recording_filename
         h5py_writer = H5Writer(
             file_path=dataset_path,
             env=env,
@@ -164,6 +159,10 @@ def run_simulation(
     state_obs_history, ctrl_state_history = [], []
     for episode_num in range(N_EPISODES):
         ep_state_history, ep_ctrl_state_history, ep_time = [], [], []
+        
+        # Get the reference base velocity in the world frame at the start of the episode
+        ref_base_lin_vel, ref_base_ang_vel = env.target_base_vel()
+        print(f"Episode {episode_num}: ref_lin_vel = {ref_base_lin_vel}, ref_ang_vel = {ref_base_ang_vel}")
         for _ in tqdm(range(N_STEPS_PER_EPISODE), desc=f"Ep:{episode_num:d}-steps:", total=N_STEPS_PER_EPISODE):
             # Update value from SE or Simulator ----------------------
             feet_pos = env.feet_pos(frame="world")
