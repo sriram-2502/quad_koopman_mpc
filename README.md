@@ -7,12 +7,14 @@
 ## project goals
 - develop EDMD models for quadruped locomotion
 - dessign Koopman based MPC controllers
+- develop terrain-aware koopman MPC to work with heightmaps
 - test controllers on flat terrain first
 
 ## TODO
-- collect data for EDMD
-- develop EDMD code using basis functions for SE3
-- check predictions
+- collect data with height maps
+- ~~collect data on flat terrain~~
+- ~~develop EDMD code using basis functions for SE3~~
+- ~~check predictions~~
 - develop KMPC code
 
 ## Overview
