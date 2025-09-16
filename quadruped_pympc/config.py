@@ -3,6 +3,7 @@ and of the internal simulations that can be launch from the folder /simulation.
 """
 import numpy as np
 from quadruped_pympc.helpers.quadruped_utils import GaitType
+from pathlib import Path
 
 # These are used both for a real experiment and a simulation -----------
 # These are the only attributes needed per quadruped, the rest can be computed automatically ----------------------
@@ -57,6 +58,22 @@ elif (robot == 'mini_cheetah'):
 gravity_constant = 9.81 # Exposed in case of different gravity conditions
 # ----------------------------------------------------------------------------------------------------------------
 
+#  Koopman MPC parameters
+koopman_mpc_params = {
+    'model_path': Path("simulation/edmd/saved_models_koopman/koopman_N200_seed4587.npz"),
+    'p_max': 5,
+    'horizon': 12,
+    'dt': 0.02,
+    'l2_reg': 1e-6,
+    # Cost matrices for MPC
+    'Q': np.diag([10.0, 10.0, 10.0,  # position
+                  1.0, 1.0, 1.0,      # orientation 
+                  1.0, 1.0, 1.0,      # linear velocity
+                  0.1, 0.1, 0.1]),    # angular velocity
+    'R': 0.1 * np.eye(12),           # control cost (12 = number of contact forces)
+}
+# ----------------------------------------------------------------------------------------------------------------
+
 mpc_params = {
     # 'nominal' optimized directly the GRF
     # 'input_rates' optimizes the delta GRF
@@ -64,6 +81,8 @@ mpc_params = {
     # 'collaborative' optimized directly the GRF and has a passive arm model inside
     # 'lyapunov' optimized directly the GRF and has a Lyapunov-based stability constraint
     # 'kinodynamic' sbrd with joints - experimental
+    # 'koopman' uses a learned koopman model for the dynamics
+
     'type':                                    'nominal',
 
     # print the mpc info
@@ -177,6 +196,7 @@ mpc_params = {
 
     # ----- END properties for the sampling-based mpc -----
     }
+
 # -----------------------------------------------------------------------
 
 simulation_params = {

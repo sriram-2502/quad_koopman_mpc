@@ -339,6 +339,9 @@ def collate_obs(list_of_dicts) -> dict[str, np.ndarray]:
 if __name__ == "__main__":
     from quadruped_pympc import config as cfg
     qpympc_cfg = cfg
+    # cfg.simulation_params["dt"] = 0.01    # sim step at 2 ms
+    # cfg.koopman_mpc_params["dt"] = 0.01   # MPC internal dt bookkeeping (model is discrete)
+    # cfg.koopman_mpc_params["mpc_frequency"] = 100   # MPC internal dt bookkeeping (model is discrete)
     out_path = run_simulation(
         qpympc_cfg=qpympc_cfg,
         num_episodes=1,
