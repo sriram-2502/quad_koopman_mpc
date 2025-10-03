@@ -119,9 +119,9 @@ class SRBDControllerInterface:
                 fz_min=fz_min,
                 fz_max=fz_max,
                 # (optional) tune weights:
-                Qv=10.0,   # linear velocity tracking
-                Qw=5.0,    # angular velocity tracking
-                Rf=1e-3,   # force regularization
+                Qv=1.0,   # linear velocity tracking
+                Qw=1.0,    # angular velocity tracking
+                Rf=1e-6,   # force regularization
             )
 
         else:
@@ -261,7 +261,7 @@ class SRBDControllerInterface:
                 # MIT convex MPC with acados
                 nmpc_GRFs, nmpc_footholds, nmpc_predicted_state = \
                     self.controller.compute_control(
-                        state_current, ref_state, contact_sequence, inertia=inertia
+                        state_current, ref_state, contact_sequence, inertia=inertia, 
                     )
                 nmpc_joints_pos = None
                 nmpc_joints_vel = None

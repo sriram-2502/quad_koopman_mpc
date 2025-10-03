@@ -13,7 +13,6 @@ def _skew(v):
                      [z,  0, -x],
                      [-y, x,  0]], dtype=float)
 
-
 class MITConvexCentroidalMPC:
     """
     Minimal convex MPC per:
@@ -21,26 +20,23 @@ class MITConvexCentroidalMPC:
 
     Decision variables: stacked ground reaction forces F = [f_FL, f_FR, f_RL, f_RR]_k for k = 0..N-1 (each f in R^3).
 
-    Centroidal SRBD dynamics (discrete Euler; state uses names p, v, theta, omega):
+    Discrete SRBD centroidal dynamics (Euler), convexified with frozen-yaw inertia:
         p_{k+1}     = p_k + dt * v_k
         v_{k+1}     = v_k + dt * ( g + (1/m) * sum_i f_{i,k} )
         theta_{k+1} = theta_k + dt * omega_k
-        omega_{k+1} = omega_k + dt * I^{-1} * sum_i ( (r_i[k] - p_ref) x f_{i,k} )
+        omega_{k+1} = omega_k + dt * I_W(yaw0)^{-1} * sum_i ( (r_i[k] - p0) x f_{i,k} )
 
-    We track desired p, v, theta, omega over the horizon, and regularize forces.
-
-    Assumptions (unchanged):
-      - Foot positions r_i are piecewise-constant (held at the current waypoint during stance/swing).
-      - Inertia I is constant in body frame (diagonal is fine).
-      - Short-horizon: torque arm uses p_ref ≈ current base p0.
-      - Contact schedule provided as contact_sequence (shape (4, N)), 1=stance, 0=swing.
-      - Friction constraints: pyramid (|fx| <= mu fz, |fy| <= mu fz, fz ∈ [fz_min, fz_max]).
+    Assumptions:
+      - Foot positions r_i[k] are in WORLD frame; torque arm uses (r_i[k] - p0) with p0 = current CoM (frozen).
+      - Inertia I is provided in BODY frame; map to WORLD using yaw0 only (Rz yaw).
+      - Contact schedule contact_sequence has shape (4, N), 1=stance, 0=swing, in _LEG_ORDER.
+      - Friction constraints: pyramid (|fx|<=mu fz, |fy|<=mu fz, fz in [fz_min,fz_max]).
     """
 
     def __init__(
         self,
         mass: float,
-        inertia: np.ndarray,  # 3x3
+        inertia: np.ndarray,  # 3x3 body-frame inertia
         N: int,
         dt: float,
         g: float = 9.81,
@@ -54,16 +50,16 @@ class MITConvexCentroidalMPC:
         Rf: float = 1e-3,
     ):
         self.m = float(mass)
-        self.I = np.array(inertia, dtype=float)
-        self.I_inv = np.linalg.inv(self.I)
+        self.Ib = np.array(inertia, dtype=float)
         self.N = int(N)
-        self.dt = config.mpc_params['dt']
+        # IMPORTANT: use the dt passed in — do not override from a global config
+        self.dt = float(dt)
         self.gvec = np.array([0.0, 0.0, -float(g)], dtype=float)
         self.mu = float(mu)
         self.fz_min = float(fz_min)
         self.fz_max = float(fz_max)
 
-        # weights (3x3 each if arrays; otherwise scalar*I)
+        # weights (3x3 each if arrays; else scalar*I)
         self.Qp = np.eye(3)*Qp if np.isscalar(Qp) else np.array(Qp, dtype=float)
         self.Qv = np.eye(3)*Qv if np.isscalar(Qv) else np.array(Qv, dtype=float)
         self.Qt = np.eye(3)*Qt if np.isscalar(Qt) else np.array(Qt, dtype=float)
@@ -73,13 +69,46 @@ class MITConvexCentroidalMPC:
         # OSQP workspace (reused)
         self._osqp = osqp.OSQP()
         self._is_warm = False
-        self._P = None
-        self._A = None
-        self._l = None
-        self._u = None
 
         # (kept for parity if you re-enable scaling later)
         self.initial_base_position = np.zeros(3)
+
+
+    def set_weight(self, nx: int = 12, nu: int = 12):
+        """
+        Minimal weights for convex centroidal MPC.
+        State order: [p(3), v(3), theta(3), omega(3)]  -> Q is (12x12)
+        Control:     [FL(3), FR(3), RL(3), RR(3)]      -> R is (12x12)
+
+        Returns:
+            Q (12x12), R (12x12)
+        """
+        import numpy as np
+
+        # --- State weights (your numbers) ---
+        # Q_position          = np.array([   0.0,    0.0, 1500.0])  # x,y,z
+        # Q_velocity          = np.array([ 200.0,  200.0,  200.0])  # vx,vy,vz
+        # Q_base_angle        = np.array([ 500.0,  500.0,    0.0])  # roll,pitch,yaw
+        # Q_base_angle_rates  = np.array([  20.0,   20.0,   50.0])  # wx,wy,wz
+
+        Q_position          = np.array([   0.0,    0.0, 1000.0])  # x,y,z
+        Q_velocity          = np.array([ 1000.0,  1000.0,  1000.0])  # vx,vy,vz
+        Q_base_angle        = np.array([ 500.0,  500.0,    0.0])  # roll,pitch,yaw
+        Q_base_angle_rates  = np.array([  20.0,   20.0,   1000.0])  # wx,wy,wz
+
+        Q = np.diag(
+            np.concatenate([Q_position, Q_velocity, Q_base_angle, Q_base_angle_rates]).astype(float)
+        )
+
+        # --- Control (force) weights per foot axis ---
+        R_per_leg = np.diag([1e-3, 1e-3, 1e-3])       # fx, fy, fz
+        R = np.kron(np.eye(4), R_per_leg)             # 4 feet -> (12x12)
+
+        # (Optional) sanity checks
+        assert Q.shape == (nx, nx), f"Q must be {nx}x{nx}, got {Q.shape}"
+        assert R.shape == (nu, nu), f"R must be {nu}x{nu}, got {R.shape}"
+
+        return Q, R
 
     # ---- internal helpers ----
     def _build_selection(self, contacts_k):
@@ -89,15 +118,17 @@ class MITConvexCentroidalMPC:
             on = 1.0 if contacts_k[i] else 0.0
             S[3*i:3*i+3, 3*i:3*i+3] = on*np.eye(3)
         return S
-    
+
     def _R_from_euler(self, euler_xyz):
+        """
+        Return Rz(yaw) only (MIT convex simplification).
+        The inputs are (roll, pitch, yaw); we only use yaw.
+        """
         rx, ry, rz = euler_xyz
-        cx, sx = np.cos(rx), np.sin(rx)
-        cy, sy = np.cos(ry), np.sin(ry)
         cz, sz = np.cos(rz), np.sin(rz)
-        Rx = np.array([[1,0,0],[0,cx,-sx],[0,sx,cx]])
-        Ry = np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]])
-        Rz = np.array([[cz,-sz,0],[sz,cz,0],[0,0,1]])
+        Rz = np.array([[cz,-sz,0],
+                       [sz, cz,0],
+                       [ 0,  0,1]])
         return Rz
 
     def _friction_pyramid_blocks(self, S: np.ndarray):
@@ -118,6 +149,7 @@ class MITConvexCentroidalMPC:
             row_fy_le_mu_fz = np.zeros((1, 12)); row_fy_le_mu_fz[:, 3*i:3*i+3] = np.array([[ 0.0,  1.0, -mu]])
             row_fy_ge_mn_mu = np.zeros((1, 12)); row_fy_ge_mn_mu[:, 3*i:3*i+3] = np.array([[ 0.0, -1.0, -mu]])
             row_fz_bounds   = np.zeros((1, 12)); row_fz_bounds[:,   3*i:3*i+3] = np.array([[ 0.0,  0.0,  1.0]])
+            # zero-out swing legs
             row_fx_le_mu_fz = row_fx_le_mu_fz @ S
             row_fx_ge_mn_mu = row_fx_ge_mn_mu @ S
             row_fy_le_mu_fz = row_fy_le_mu_fz @ S
@@ -131,11 +163,8 @@ class MITConvexCentroidalMPC:
 
     def _feet_refs_over_horizon(self, ref_state, contacts):
         """
-        Build per-stage foot references r_i[k] (i in {FL,FR,RL,RR}), size (N,4,3),
-        mimicking the NMPC logic:
-          - At each stage j, use the current index for each leg's ref_foot_*.
-          - When a leg transitions stance->swing (1->0) between j and j+1,
-            advance that leg's index (if another waypoint exists).
+        Build per-stage foot references r_i[k] (i in {FL,FR,RL,RR}), size (N,4,3).
+        Uses the stepping rule: advance leg's waypoint when it transitions stance->swing.
         """
         N = self.N
         rFL_all = np.atleast_2d(np.array(ref_state["ref_foot_FL"], dtype=float))
@@ -227,21 +256,6 @@ class MITConvexCentroidalMPC:
         gw = np.hstack(gw_list)    # (3N,)
 
         return Bv, Bw, gv, gw, S_block
-    
-    def debug_residuals(p0, feet_world, f, mass, g=np.array([0,0,-9.81])):
-        # p0, feet_world: (3,), (4,3) in WORLD frame at k=0
-        # f: (12,) stacked [FL,FR,RL,RR] with (fx,fy,fz) per foot at k=0
-        F = f.reshape(4,3)
-        netF = F.sum(axis=0) + mass * g
-        tau = np.zeros(3)
-        for i in range(4):
-            r = feet_world[i] - p0
-            tau += np.cross(r, F[i])
-        print("[debug] net force (should be ~0):", netF)
-        print("[debug] net moment about COM (should be ~0):", tau)
-        # Useful projections
-        print("[debug] pitch moment (y):", tau[1])
-        print("[debug] total fz and mg:", F[:,2].sum(), mass*abs(g[2]))
 
     # ---- main API ----
     def compute_control(self, state_current, ref_state, contact_sequence, inertia=None):
@@ -251,13 +265,13 @@ class MITConvexCentroidalMPC:
             - position            : (3,)
             - linear_velocity     : (3,)
             - angular_velocity    : (3,)
-            - orientation         : (3,)  # used if available for theta0
+            - orientation         : (3,)  # roll, pitch, yaw
         ref_state:
             - ref_position        : (N x 3) or (1 x 3)
             - ref_linear_velocity : (N x 3) or (1 x 3)
             - ref_orientation     : (N x 3) or (1 x 3)
             - ref_angular_velocity: (N x 3) or (1 x 3)
-            - ref_foot_FL, ref_foot_FR, ref_foot_RL, ref_foot_RR : (T_i x 3)
+            - ref_foot_FL, ref_foot_FR, ref_foot_RL, ref_foot_RR : (T_i x 3), WORLD frame
         contact_sequence: (4 x N) array of {0,1}
         Returns:
             f0: (12,) forces at k=0 (fx,fy,fz for FL,FR,RL,RR)
@@ -290,12 +304,12 @@ class MITConvexCentroidalMPC:
 
         contacts = np.array(contact_sequence, dtype=float)  # (4, N)
 
-        # assuming yaw is zero or constant
-        R0 = self._R_from_euler(ref_state["ref_orientation"])
-        I_world0 = R0 @ self.I @ R0.T
+        # Map inertia to WORLD using yaw0 only (MIT convex simplification)
+        Rz = self._R_from_euler(theta0)      # uses yaw component only
+        I_world0 = Rz @ self.Ib @ Rz.T
         I_world0_inv = np.linalg.inv(I_world0)
 
-        # Per-stage foot references (N,4,3)
+        # Per-stage foot references (N,4,3) in WORLD
         r_over_h = self._feet_refs_over_horizon(ref_state, contacts)
 
         # --- build v, omega maps (core dynamics) ---
@@ -304,7 +318,7 @@ class MITConvexCentroidalMPC:
         Bw_s = sparse.csc_matrix(Bw)
 
         # --- integrate to get position (p) and orientation (theta) maps ---
-        # Build strictly-lower block accumulator C (row k sums cols 0..k-1).
+        # Strictly-lower block accumulator C (row k sums cols 0..k-1).
         I3 = np.eye(3)
         C_blocks = []
         for k in range(N):
@@ -321,46 +335,24 @@ class MITConvexCentroidalMPC:
         Oref = oref.reshape(3*N)
         Wref = wref.reshape(3*N)
 
-        # p map: Pstack = (dt*C)* (Bv F + gv) + kron(1_N, p0 + dt*v0)
+        # p map: Pstack = (dt*C)* (Bv F + gv) + kron(1_N, p0)
         Bp_s = (self.dt * C_s) @ Bv_s
-        gp = self.dt * (C_s @ gv)  # gv is (3N,)
-        gp = np.asarray(gp).reshape(3*N) + np.kron(oneN, (p0)).reshape(3*N)
+        gp = self.dt * (C_s @ gv)               # integrate gv
+        gp = np.asarray(gp).reshape(3*N) + np.kron(oneN, p0).reshape(3*N)
 
-        # theta map: Tstack = (dt*C)* (Bw F + gw) + kron(1_N, theta0 + dt*w0)
+        # theta map: Tstack = (dt*C)* (Bw F + gw) + kron(1_N, theta0)
         Btheta_s = (self.dt * C_s) @ Bw_s
-        gtheta = self.dt * (C_s @ gw)  # gw is (3N,)
-        gtheta = np.asarray(gtheta).reshape(3*N) + np.kron(oneN, (theta0)).reshape(3*N)
+        gtheta = self.dt * (C_s @ gw)           # integrate gw
+        gtheta = np.asarray(gtheta).reshape(3*N) + np.kron(oneN, theta0).reshape(3*N)
 
-        # === Quadratic cost: track p, v, theta, omega; regularize forces ===
-        Qp_blk = sparse.kron(sparse.eye(N, format="csc"), sparse.csc_matrix(self.Qp))
-        Qv_blk = sparse.kron(sparse.eye(N, format="csc"), sparse.csc_matrix(self.Qv))
-        Qt_blk = sparse.kron(sparse.eye(N, format="csc"), sparse.csc_matrix(self.Qt))
-        Qw_blk = sparse.kron(sparse.eye(N, format="csc"), sparse.csc_matrix(self.Qw))
-
-        P = (
-            (Bp_s.T @ Qp_blk @ Bp_s)
-            + (Bv_s.T @ Qv_blk @ Bv_s)
-            + (Btheta_s.T @ Qt_blk @ Btheta_s)
-            + (Bw_s.T @ Qw_blk @ Bw_s)
-            + self.Rf * sparse.eye(12 * N, format="csc")
-        )
-        P = 0.5 * (P + P.T)
-
-        q = (
-            (Bp_s.T @ (Qp_blk @ (gp - Pref)))
-            + (Bv_s.T @ (Qv_blk @ (gv - Vref)))
-            + (Btheta_s.T @ (Qt_blk @ (gtheta - Oref)))
-            + (Bw_s.T @ (Qw_blk @ (gw - Wref)))
-        )
-        q = np.asarray(q).reshape(-1)
-
-        # === Force references from contact schedule (fx=fy=0; fz=m*g/legs_in_stance) ===
-        g_mag = float(abs(self.gvec[2])) if self.gvec.shape[0] == 3 else 9.81
+        # === Build force reference from contact schedule (fx=fy=0; fz = mg / #stance) ===
+        g_mag = float(abs(self.gvec[2]))
+        m = self.m
         Fref_list = []
         for k in range(N):
             c = contacts[:, k].astype(float)  # [FL, FR, RL, RR] in {0,1}
             legs_in_stance = int(c.sum())
-            fz_each = (self.m * g_mag / legs_in_stance) if legs_in_stance > 0 else 0.0
+            fz_each = (m * g_mag / legs_in_stance) if legs_in_stance > 0 else 0.0
             f_FL = np.array([0.0, 0.0, fz_each * c[0]])
             f_FR = np.array([0.0, 0.0, fz_each * c[1]])
             f_RL = np.array([0.0, 0.0, fz_each * c[2]])
@@ -368,12 +360,37 @@ class MITConvexCentroidalMPC:
             Fref_list.append(np.hstack([f_FL, f_FR, f_RL, f_RR]))
         Fref = np.hstack(Fref_list)  # (12*N,)
 
-        # Regularization shift: 0.5 F^T R F -> q := q - R * Fref  (R = Rf*I here)
-        if np.isscalar(self.Rf):
-            q = q - float(self.Rf) * Fref
-        else:
-            R_blk = sparse.kron(sparse.eye(N, format="csc"), sparse.csc_matrix(self.Rf))
-            q = q - np.asarray(R_blk @ Fref).reshape(-1)
+        # === Stacked state map: x_stack = Sx * F + gx ===
+        # Order matches state: [p(3N); v(3N); theta(3N); omega(3N)]
+        Sx_s = sparse.vstack([Bp_s, Bv_s, Btheta_s, Bw_s], format="csc")  # (12N x 12N)
+        gx   = np.hstack([gp,    gv,    gtheta,    gw   ])                # (12N,)
+        Xref = np.hstack([Pref,  Vref,  Oref,      Wref ])                # (12N,)
+
+        # === Weights from your simple setter ===
+        Q_state12, R_force12 = self.set_weight(nx=12, nu=12)
+        Q_big = sparse.kron(sparse.eye(N, format="csc"), sparse.csc_matrix(Q_state12), format="csc")  # (12N x 12N)
+        R_big = sparse.kron(sparse.eye(N, format="csc"), sparse.csc_matrix(R_force12), format="csc")  # (12N x 12N)
+
+        # === Quadratic program: 0.5 F^T P F + q^T F
+        P = (Sx_s.T @ Q_big @ Sx_s) + R_big
+        P = 0.5 * (P + P.T)  # symmetrize for OSQP
+        P = P.tocsc()        # ensure CSC for OSQP
+
+        # Build q as dense 1-D vector (avoid sparse/matrix types)
+        delta_x = (gx - Xref)                      # (12N,)
+        t1 = Sx_s.T.dot(Q_big.dot(delta_x))        # may be np.matrix / sparse
+        t2 = R_big.dot(Fref)                       # may be np.matrix / sparse
+
+        # Convert both to flat dense arrays
+        if hasattr(t1, "toarray"):  # sparse -> dense
+            t1 = t1.toarray()
+        t1 = np.asarray(t1, dtype=np.float64).ravel()
+
+        if hasattr(t2, "toarray"):
+            t2 = t2.toarray()
+        t2 = np.asarray(t2, dtype=np.float64).ravel()
+
+        q = (t1 - t2).astype(np.float64)           # (12N,)
 
         # === Inequalities: friction pyramid + normal force bounds, per stage ===
         A_rows, l_list, u_list = [], [], []
@@ -396,7 +413,9 @@ class MITConvexCentroidalMPC:
         prob.setup(P=P, q=q, A=A, l=l, u=u, warm_start=self._is_warm, verbose=False)
         res = prob.solve()
         if res.info.status_val not in (1, 2):
+            # Infeasible: return zeros (and you’ll see residual print below)
             F = np.zeros(12 * N)
+            self._is_warm = False
         else:
             F = res.x
             self._is_warm = True
@@ -404,22 +423,20 @@ class MITConvexCentroidalMPC:
         # First control (12,) — return GRFs for stage 0
         f0 = F[:12]
 
-        # --------- quick debug (current vs reference) ----------
-        curr_fx = np.asarray(f0)[0::3]
-        curr_fy = np.asarray(f0)[1::3]
-        curr_fz = np.asarray(f0)[2::3]
-        ref_fx0 = np.asarray(Fref[:12])[0::3]
-        ref_fy0 = np.asarray(Fref[:12])[1::3]
-        ref_fz0 = np.asarray(Fref[:12])[2::3]
+        # --------- quick residual debug (current first) ----------
+        def _debug_residuals(p0, feet_world_4x3, f12, mass, grav=np.array([0,0,-9.81], float)):
+            p0 = np.asarray(p0, float).reshape(3,)
+            Fk = np.asarray(f12, float).reshape(4,3)
+            feet = np.asarray(feet_world_4x3, float).reshape(4,3)
+            m = float(mass)
+            g = np.asarray(grav, float).reshape(3,)
+            netF = Fk.sum(axis=0) + m*g
+            tau = np.zeros(3)
+            for i in range(4):
+                tau += np.cross(feet[i] - p0, Fk[i])
+            print("[resid] netF:", netF, " tau:", tau)
 
-        # --------- debug (current first, then reference) ----------
-        # print(f"[DEBUG] euler={theta0} | f0(x,y,z)=({curr_fx}, {curr_fy}, {curr_fz})")
-        # print(f"[DEBUG] ref={oref[0]} | ref(x,y,z)=({ref_fx0}, {ref_fy0}, {ref_fz0})")
-        # print(f"[DEBUG] euler={theta0} | f0(x,y,z)=({curr_fx}")
-        # print(f"[DEBUG] ref={oref[0]} | ref(x,y,z)=({ref_fx0}")
-        # ----------------------------------------------------------
-
-        # -------------------------------------------------------
+        # _debug_residuals(p0, r_over_h[0,:,:], f0.reshape(4,3), self.m, self.gvec)
 
         # --- rollout for logging/preview (p, v, theta, omega) ---
         pred = np.zeros((N + 1, 12))
@@ -429,9 +446,8 @@ class MITConvexCentroidalMPC:
             fk = F[12 * k : 12 * (k + 1)].reshape(4, 3)
             acc = self.gvec + (1.0 / self.m) * fk.sum(axis=0)
             tau = np.zeros(3)
-            # use per-stage feet for torque arm
             for i in range(4):
-                tau += np.cross(r_over_h[k, i, :] - p, fk[i])
+                tau += np.cross(r_over_h[k, i, :] - p0, fk[i])  # torque arm uses p0 (frozen)
             alpha = I_world0_inv @ tau
             p = p + dt * v
             v = v + dt * acc
@@ -441,8 +457,6 @@ class MITConvexCentroidalMPC:
 
         footholds = [r_over_h[0, i, :] for i in range(4)]
         return f0, footholds, pred
-
-        
 
     def reset(self):
         """

@@ -72,6 +72,7 @@ koopman_mpc_params = {
                   0.1, 0.1, 0.1]),    # angular velocity
     'R': 0.1 * np.eye(12),           # control cost (12 = number of contact forces)
 }
+
 # ----------------------------------------------------------------------------------------------------------------
 
 mpc_params = {
@@ -162,7 +163,7 @@ mpc_params = {
 
     # this is used to compensate for the external wrenches
     # you should provide explicitly this value in compute_control
-    'external_wrenches_compensation':          True,
+    'external_wrenches_compensation':          False,
     'external_wrenches_compensation_num_step': 15,
 
     # this is used only in the case of collaborative mpc, to

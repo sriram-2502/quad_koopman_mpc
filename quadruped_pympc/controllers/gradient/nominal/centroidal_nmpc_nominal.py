@@ -1189,7 +1189,7 @@ class Acados_NMPC_Nominal:
                     if reference['ref_foot_RR'].shape[0] > idx_ref_foot_to_assign[3] + 1:
                         idx_ref_foot_to_assign[3] += 1
 
-                        # Calculate the reference force z for the leg in stance
+            # Calculate the reference force z for the leg in stance
             # It's simply mass*acc/number_of_legs_in_stance!!
             # Force x and y are always 0
             number_of_legs_in_stance = np.array(
