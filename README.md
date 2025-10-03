@@ -107,6 +107,7 @@ The first time you run the simulation with acados, in the terminal you will be a
   ```
   cmake_minimum_required(VERSION 3.5)
   ```
+  repeat for CMakeLists of other solvers also (based on what opens you set in acados build)
 
 - If you see a warning about CasADi version 3.7.0 not being supported, uninstall it and install version 3.6.7 using conda:
   ```

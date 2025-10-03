@@ -34,19 +34,8 @@ _default_runner = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_default_runner)
 run_simulation = _default_runner.run_simulation
 
-# ---------- Import plot helper (package or by-file fallback) ----------
-try:
-    # if you added __init__.py in simulation/tools, this will work:
-    from simulation.tools.plot_episode import plot_episode_grfs
-except Exception:
-    # fallback: load by path without requiring packages
-    PLOT_HELPER = REPO_ROOT / "simulation" / "tools" / "plot_episode.py"
-    if not PLOT_HELPER.exists():
-        raise FileNotFoundError(f"Plot helper not found at: {PLOT_HELPER}")
-    _spec2 = importlib.util.spec_from_file_location("plot_episode", str(PLOT_HELPER))
-    _mod2 = importlib.util.module_from_spec(_spec2)
-    _spec2.loader.exec_module(_mod2)
-    plot_episode_grfs = _mod2.plot_episode_grfs
+# ---------- Import plot helper ----------
+from tools.plot_episode import plot_episode_grfs, plot_episode_states
 
 if __name__ == "__main__":
     # Save to simulation/baseline_logs
@@ -70,6 +59,18 @@ if __name__ == "__main__":
 
     print(f"\nSaved trajectory to: {out_h5}")
 
+    # Full episode, radians:
+    plot_episode_states(
+        Path(out_h5),
+        episode_idx=0,
+        center_xy=False,        # set True to start x,y at 0 (subtract first sample)
+        t0=None,                # e.g., 0.0 to start at 0s
+        duration=None,          # e.g., 5.0 to plot first 5 seconds
+        unwrap_yaw=False,       # True to unwrap yaw for continuity
+        deg=False,              # True to plot angles in degrees
+        title_suffix="Baseline MPC",
+    )
+
     # Plot episode GRFs (robust time handling & stance shading)
     plot_episode_grfs(
         Path(out_h5),
@@ -79,3 +80,5 @@ if __name__ == "__main__":
         fz_ylim=None,           # auto-pick vertical axis limits for fz
         title_suffix="Baseline MPC",
     )
+
+

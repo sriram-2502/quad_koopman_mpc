@@ -51,7 +51,7 @@ def run_simulation(
     num_seconds_per_episode=10,
     ref_base_lin_vel=(0.0, 2.0),
     ref_base_ang_vel=(-0.4, 0.4),
-    friction_coeff=(0.5, 1.0),
+    friction_coeff=(1.0),
     base_vel_command_type="forward+rotate",  # "forward", "random", "forward+rotate", "human"
     seed=0,
     render=False,
@@ -82,6 +82,17 @@ def run_simulation(
         base_vel_command_type=base_vel_command_type,  # "forward", "random", "forward+rotate", "human"
         state_obs_names=tuple(state_obs_names),
     )
+
+    # start env at zero
+    z0 = hip_height
+    opts = {
+        "base_pos":  [0.0, 0.0, z0],
+        "base_rpy":  [0.0, 0.0, 0.0],
+        "base_vlin": [0.0, 0.0, 0.0],
+        "base_vang": [0.0, 0.0, 0.0],
+    }
+    env.reset(options=opts)
+
     pprint(env.get_hyperparameters())
     env.mjModel.opt.gravity[2] = -qpympc_cfg.gravity_constant
 

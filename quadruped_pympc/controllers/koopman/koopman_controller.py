@@ -47,8 +47,10 @@ class KoopmanController:
         Q = np.array(cfg.koopman_mpc_params.get("Q", np.eye(self.nx)))
         R = np.array(cfg.koopman_mpc_params.get("R", 0.1 * np.eye(B.shape[1])))
 
-        # --- EDMD lift honoring p_max from config ---
+        # --- EDMD lift honoring p_max from config, with clean wrapper ---
         p_max_cfg = int(cfg.koopman_mpc_params.get("p_max", 5))
+
+        # import lift_1d from simulation/edmd/edmd_runner.py
         import importlib.util, sys
         edmd_file = Path(__file__).resolve().parents[3] / "simulation" / "edmd" / "edmd_runner.py"
         edmd_dir  = edmd_file.parent
@@ -58,9 +60,14 @@ class KoopmanController:
         edmd = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(edmd)
         _lift_1d = getattr(edmd, "lift_1d")
-        def lift_with_cfg(X): return _lift_1d(X, p_max=p_max_cfg)
+
+        # Clean wrapper: accepts **kwargs so Koopman_MPC can pass p_max without errors.
+        def lift_with_cfg(X, **kwargs):
+            # Always use the controller's p_max_cfg; ignore any external p_max.
+            return _lift_1d(X, p_max=p_max_cfg)
 
         # --- MPC instance ---
+        # Note: Koopman_MPC may call lift_fn(..., p_max=...), which our wrapper accepts.
         self.mpc = Koopman_MPC(A=A, B=B, C=C, horizon=self.N, Q=Q, R=R, lift_fn=lift_with_cfg)
 
         # --- logging buffers ---

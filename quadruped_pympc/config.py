@@ -60,7 +60,7 @@ gravity_constant = 9.81 # Exposed in case of different gravity conditions
 
 #  Koopman MPC parameters
 koopman_mpc_params = {
-    'model_path': Path("simulation/edmd/saved_models_koopman/koopman_N200_seed4587.npz"),
+    'model_path': Path("simulation/edmd/saved_models_koopman/test_model.npz"),
     'p_max': 5,
     'horizon': 12,
     'dt': 0.02,

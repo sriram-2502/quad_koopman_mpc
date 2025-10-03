@@ -5,6 +5,18 @@ from gym_quadruped.utils.quadruped_utils import LegsAttr
 
 from quadruped_pympc import config as cfg
 from quadruped_pympc.controllers.koopman import KoopmanController
+# ADD:
+from quadruped_pympc.controllers.convex.mit_convex_mpc import MITConvexCentroidalMPC
+
+def _get_from_cfg():
+    mass = getattr(cfg, "mass", 12.0)
+    inertia = getattr(cfg, "inertia", np.diag([0.07, 0.26, 0.28]))
+    g = getattr(cfg, "gravity_constant", 9.81)
+    mp = getattr(cfg, "mpc_params", {}) or {}
+    mu = mp.get("mu", 0.5)
+    grf_max = mp.get("grf_max", mass * g)
+    grf_min = mp.get("grf_min", 0.0)
+    return float(mass), np.array(inertia, float), float(g), float(mu), float(grf_min), float(grf_max)
 
 
 class SRBDControllerInterface:
@@ -18,6 +30,9 @@ class SRBDControllerInterface:
         self.optimize_step_freq = cfg.mpc_params["optimize_step_freq"]
         self.step_freq_available = cfg.mpc_params["step_freq_available"]
 
+        # Pull physical + limit params from config (single source of truth)
+        self.mass, self.inertia_cfg, self.g, self.mu, self.fz_min, self.fz_max = _get_from_cfg()
+
         self.previous_contact_mpc = np.array([1, 1, 1, 1])
 
         # 'nominal'       optimizes directly the GRF (gradient-based)
@@ -27,60 +42,53 @@ class SRBDControllerInterface:
         # 'lyapunov'      GRF + Lyapunov constraint (gradient-based)
         # 'kinodynamic'   SRBD with joints (experimental)
         # 'koopman'       learned linear Koopman model (this branch)
+
         if self.type == "nominal":
             from quadruped_pympc.controllers.gradient.nominal.centroidal_nmpc_nominal import (
                 Acados_NMPC_Nominal,
             )
-
             self.controller = Acados_NMPC_Nominal()
 
             if self.optimize_step_freq:
                 from quadruped_pympc.controllers.gradient.nominal.centroidal_nmpc_gait_adaptive import (
                     Acados_NMPC_GaitAdaptive,
                 )
-
                 self.batched_controller = Acados_NMPC_GaitAdaptive()
 
         elif self.type == "input_rates":
             from quadruped_pympc.controllers.gradient.input_rates.centroidal_nmpc_input_rates import (
                 Acados_NMPC_InputRates,
             )
-
             self.controller = Acados_NMPC_InputRates()
 
             if self.optimize_step_freq:
                 from quadruped_pympc.controllers.gradient.nominal.centroidal_nmpc_gait_adaptive import (
                     Acados_NMPC_GaitAdaptive,
                 )
-
                 self.batched_controller = Acados_NMPC_GaitAdaptive()
 
         elif self.type == "lyapunov":
             from quadruped_pympc.controllers.gradient.lyapunov.centroidal_nmpc_lyapunov import (
                 Acados_NMPC_Lyapunov,
             )
-
             self.controller = Acados_NMPC_Lyapunov()
 
             if self.optimize_step_freq:
                 from quadruped_pympc.controllers.gradient.nominal.centroidal_nmpc_gait_adaptive import (
                     Acados_NMPC_GaitAdaptive,
                 )
-
                 self.batched_controller = Acados_NMPC_GaitAdaptive()
 
         elif self.type == "kinodynamic":
             from quadruped_pympc.controllers.gradient.kinodynamic.kinodynamic_nmpc import (
                 Acados_NMPC_KinoDynamic,
             )
-
             self.controller = Acados_NMPC_KinoDynamic()
 
             if self.optimize_step_freq:
                 from quadruped_pympc.controllers.gradient.nominal.centroidal_nmpc_gait_adaptive import (
                     Acados_NMPC_GaitAdaptive,
                 )
-
                 self.batched_controller = Acados_NMPC_GaitAdaptive()
 
         elif self.type == "sampling":
@@ -92,12 +100,29 @@ class SRBDControllerInterface:
                 from quadruped_pympc.controllers.sampling.centroidal_nmpc_jax import (
                     Sampling_MPC,
                 )
-
             self.controller = Sampling_MPC()
 
         elif self.type == "koopman":
-            # New: learned linear Koopman controller (GRF optimization)
+            # Learned linear Koopman controller (GRF optimization)
             self.controller = KoopmanController(cfg)
+
+        elif self.type == "mit_convex":
+            mass, inertia_cfg, g, mu, fz_min, fz_max = _get_from_cfg()
+            # Instantiate the centroidal convex MPC per the MIT paper
+            self.controller = MITConvexCentroidalMPC(
+                mass=mass,
+                inertia=inertia_cfg,
+                N=self.horizon,
+                dt=self.mpc_dt,
+                g=g,
+                mu=mu,
+                fz_min=fz_min,
+                fz_max=fz_max,
+                # (optional) tune weights:
+                Qv=10.0,   # linear velocity tracking
+                Qw=5.0,    # angular velocity tracking
+                Rf=1e-3,   # force regularization
+            )
 
         else:
             raise ValueError(f"Unknown MPC type: {self.type}")
@@ -232,8 +257,18 @@ class SRBDControllerInterface:
                     FL=nmpc_joints_acc[0:3], FR=nmpc_joints_acc[3:6], RL=nmpc_joints_acc[6:9], RR=nmpc_joints_acc[9:12]
                 )
 
+            elif self.type == "mit_convex":
+                # MIT convex MPC with acados
+                nmpc_GRFs, nmpc_footholds, nmpc_predicted_state = \
+                    self.controller.compute_control(
+                        state_current, ref_state, contact_sequence, inertia=inertia
+                    )
+                nmpc_joints_pos = None
+                nmpc_joints_vel = None
+                nmpc_joints_acc = None
+
             else:
-                # Includes 'nominal', 'input_rates', 'lyapunov', and NEW 'koopman'
+                # Includes 'nominal', 'input_rates', 'lyapunov', and 'koopman'
                 nmpc_GRFs, nmpc_footholds, nmpc_predicted_state, _ = self.controller.compute_control(
                     state_current, ref_state, contact_sequence, inertia=inertia, external_wrenches=external_wrenches
                 )

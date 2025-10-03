@@ -190,3 +190,149 @@ def plot_episode_grfs(
     plt.legend()
     plt.tight_layout()
     plt.show()
+
+def plot_episode_states(
+    h5_path: Path | str,
+    episode_idx: int = 0,
+    *,
+    center_xy: bool = False,
+    t0: Optional[float] = None,
+    duration: Optional[float] = None,
+    unwrap_yaw: bool = False,
+    deg: bool = False,
+    title_suffix: str = "",
+):
+    """
+    Plot base states (x,y,z), Euler angles (roll,pitch,yaw), linear and angular velocities for one episode.
+
+    Args:
+        h5_path: HDF5 file path.
+        episode_idx: episode index to load.
+        center_xy: if True, subtract (x0,y0) so position starts at (0,0).
+        t0: optional start time (s) for slicing.
+        duration: optional duration (s) from t0; if None, uses full range.
+        unwrap_yaw: if True, unwrap yaw for continuity (good for long turns).
+        deg: if True, plot angles in degrees (default radians).
+        title_suffix: extra text to append to the figure title.
+
+    Notes:
+        - Requires datasets under '/recordings': time, base_pos, base_ori_euler_xyz,
+          base_lin_vel, base_ang_vel.
+        - Time is sorted if non-monotonic; all arrays are trimmed to the shortest length.
+    """
+    h5_path = Path(h5_path)
+    if not h5_path.exists():
+        raise FileNotFoundError(h5_path)
+
+    with h5py.File(h5_path, "r") as f:
+        t = _load_episode_array(f, "time", episode_idx)
+        if t is None:
+            raise RuntimeError("Missing '/recordings/time' for the selected episode.")
+        t = _to_1d(t)
+
+        pos  = _load_episode_array(f, "base_pos", episode_idx)              # (T,3)
+        eul  = _load_episode_array(f, "base_ori_euler_xyz", episode_idx)    # (T,3)
+        vlin = _load_episode_array(f, "base_lin_vel", episode_idx)          # (T,3)
+        vang = _load_episode_array(f, "base_ang_vel", episode_idx)          # (T,3)
+
+        for name, arr in [("base_pos", pos), ("base_ori_euler_xyz", eul),
+                          ("base_lin_vel", vlin), ("base_ang_vel", vang)]:
+            if arr is None:
+                raise RuntimeError(f"Missing '/recordings/{name}' for episode {episode_idx}.")
+
+        # Ensure 2D shapes
+        pos  = np.asarray(pos,  float).reshape(-1, 3)
+        eul  = np.asarray(eul,  float).reshape(-1, 3)
+        vlin = np.asarray(vlin, float).reshape(-1, 3)
+        vang = np.asarray(vang, float).reshape(-1, 3)
+
+    # Sort by time if needed
+    order = np.argsort(t)
+    t     = t[order]
+    pos   = pos[order]
+    eul   = eul[order]
+    vlin  = vlin[order]
+    vang  = vang[order]
+
+    # Trim to common length
+    t, pos, eul, vlin, vang = _same_len(t, pos, eul, vlin, vang)
+
+    # Apply optional time window
+    tmin, tmax = float(t[0]), float(t[-1])
+    if duration is None and t0 is None:
+        mask = np.ones_like(t, dtype=bool)
+        t0_show, t1_show = tmin, tmax
+    else:
+        if t0 is None:
+            t0 = tmin
+        t1 = t0 + (duration if duration is not None else (tmax - t0))
+        t0_show, t1_show = max(tmin, t0), min(tmax, t1)
+        mask = (t >= t0_show) & (t <= t1_show)
+        if not np.any(mask):
+            raise ValueError(f"No samples in requested window [{t0_show:.3f}, {t1_show:.3f}] s")
+
+    t     = t[mask]
+    pos   = pos[mask]
+    eul   = eul[mask]
+    vlin  = vlin[mask]
+    vang  = vang[mask]
+
+    # Optional centering of x,y to start at zero
+    if center_xy and len(pos) > 0:
+        anchor_xy = pos[0, :2].copy()
+        pos[:, 0] -= anchor_xy[0]
+        pos[:, 1] -= anchor_xy[1]
+
+    # Optional yaw unwrap and angle units
+    if unwrap_yaw and len(eul) > 0:
+        eul[:, 2] = np.unwrap(eul[:, 2], discont=np.pi)
+    if deg:
+        eul = np.degrees(eul)
+
+    # Plot
+    fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
+
+    # 1) Position
+    axes[0].plot(t, pos[:, 0], label="x")
+    axes[0].plot(t, pos[:, 1], label="y")
+    axes[0].plot(t, pos[:, 2], label="z")
+    axes[0].set_ylabel("pos (m)")
+    axes[0].grid(True, linestyle=":")
+    axes[0].legend(ncol=3)
+
+    # 2) Euler angles
+    aunit = "deg" if deg else "rad"
+    axes[1].plot(t, eul[:, 0], label=f"roll ({aunit})")
+    axes[1].plot(t, eul[:, 1], label=f"pitch ({aunit})")
+    axes[1].plot(t, eul[:, 2], label=f"yaw ({aunit})")
+    axes[1].set_ylabel(f"Euler ({aunit})")
+    axes[1].grid(True, linestyle=":")
+    axes[1].legend(ncol=3)
+
+    # 3) Linear velocity
+    axes[2].plot(t, vlin[:, 0], label="vx")
+    axes[2].plot(t, vlin[:, 1], label="vy")
+    axes[2].plot(t, vlin[:, 2], label="vz")
+    axes[2].set_ylabel("lin vel (m/s)")
+    axes[2].grid(True, linestyle=":")
+    axes[2].legend(ncol=3)
+
+    # 4) Angular velocity
+    axes[3].plot(t, vang[:, 0], label="wx")
+    axes[3].plot(t, vang[:, 1], label="wy")
+    axes[3].plot(t, vang[:, 2], label="wz")
+    axes[3].set_ylabel("ang vel (rad/s)")
+    axes[3].set_xlabel("time (s)")
+    axes[3].grid(True, linestyle=":")
+    axes[3].legend(ncol=3)
+
+    ttl = f"Episode {episode_idx} — base states"
+    if center_xy:
+        ttl += " (centered x,y)"
+    if (duration is not None) or (t0 is not None):
+        ttl += f" [{t0_show:.2f}, {t1_show:.2f}] s"
+    if title_suffix:
+        ttl += f" — {title_suffix}"
+    fig.suptitle(ttl)
+    plt.tight_layout()
+    plt.show()
