@@ -124,6 +124,29 @@ The first time you run the simulation with acados, in the terminal you will be a
   ```
   export LD_LIBRARY_PATH=/opt/ros/noetic/lib:/home/sriramk/legged_robot_ws/devel/lib:/home/sriramk/Quadruped-PyMPC/quadruped_pympc/acados/lib
   ```
+- If you see errors with the acaods template not working inside conda like below
+  ```bash
+  (quad_kmpc) sriramk@DESKTOP-GUT7621:~/quad_koopman_mpc/simulation$ python simulation.py
+  Traceback (most recent call last):
+    File "/home/sriramk/quad_koopman_mpc/simulation/simulation.py", line 28, in <module>
+      from quadruped_pympc.quadruped_pympc_wrapper import QuadrupedPyMPC_Wrapper
+    File "/home/sriramk/quad_koopman_mpc/quadruped_pympc/quadruped_pympc_wrapper.py", line 6, in <module>
+      from quadruped_pympc.interfaces.srbd_controller_interface import SRBDControllerInterface
+    File "/home/sriramk/quad_koopman_mpc/quadruped_pympc/interfaces/srbd_controller_interface.py", line 9, in <module>
+      from quadruped_pympc.controllers.convex.mit_convex_mpc import MITConvexCentroidalMPC
+    File "/home/sriramk/quad_koopman_mpc/quadruped_pympc/controllers/convex/mit_convex_mpc.py", line 3, in <module>
+      from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
+  ModuleNotFoundError: No module named 'acados_template'
+  ```
+  Here is the fix
+  ```bash
+  cd ~/quad_koopman_mpc/quadruped_pympc/acados/build
+  
+  # If you previously saw "Defaulting to user installation", force the prefix to the conda env:
+  python -m pip install -e ../interfaces/acados_template \
+      --no-build-isolation --config-settings editable_mode=compat \
+      --prefix "$CONDA_PREFIX"
+  ```
 
 ---
 
