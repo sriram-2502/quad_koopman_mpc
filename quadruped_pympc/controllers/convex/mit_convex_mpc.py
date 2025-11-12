@@ -1,467 +1,491 @@
-# quadruped_pympc/controllers/convex/mit_convex_mpc.py
 import numpy as np
-import osqp
 from scipy import sparse
-import copy
-import quadruped_pympc.config as config
+from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
+from casadi import MX, vertcat, horzcat, reshape, cos, sin
 
 _LEG_ORDER = ("FL", "FR", "RL", "RR")
 
-def _skew(v):
-    x, y, z = v
-    return np.array([[0, -z,  y],
-                     [z,  0, -x],
-                     [-y, x,  0]], dtype=float)
 
 class MITConvexCentroidalMPC:
     """
-    Minimal convex MPC per:
-      Di Carlo et al., "Dynamic Locomotion in the MIT Cheetah 3 Through Convex Model-Predictive Control".
+    MIT-cheetah-style convex centroidal MPC (affine, time-varying) with your state order:
+      x = [p(3); v(3); theta(3); omega(3)], u = [f_FL; f_FR; f_RL; f_RR] \in R^{12}.
 
-    Decision variables: stacked ground reaction forces F = [f_FL, f_FR, f_RL, f_RR]_k for k = 0..N-1 (each f in R^3).
-
-    Discrete SRBD centroidal dynamics (Euler), convexified with frozen-yaw inertia:
+      Discrete dynamics:
         p_{k+1}     = p_k + dt * v_k
-        v_{k+1}     = v_k + dt * ( g + (1/m) * sum_i f_{i,k} )
-        theta_{k+1} = theta_k + dt * omega_k
-        omega_{k+1} = omega_k + dt * I_W(yaw0)^{-1} * sum_i ( (r_i[k] - p0) x f_{i,k} )
+        v_{k+1}     = v_k + dt * ( g + (1/m) * Σ_i f_{i,k} )
+        theta_{k+1} = theta_k + dt * Rz(psi_k)^T * omega_k
+        omega_{k+1} = omega_k + dt * Iw^{-1}(psi_k) * Σ_i S(r_{i,k}-pbar_k) f_{i,k}
 
-    Assumptions:
-      - Foot positions r_i[k] are in WORLD frame; torque arm uses (r_i[k] - p0) with p0 = current CoM (frozen).
-      - Inertia I is provided in BODY frame; map to WORLD using yaw0 only (Rz yaw).
-      - Contact schedule contact_sequence has shape (4, N), 1=stance, 0=swing, in _LEG_ORDER.
-      - Friction constraints: pyramid (|fx|<=mu fz, |fy|<=mu fz, fz in [fz_min,fz_max]).
+      Stage cost:    ||x - xref||_Q^2 + ||u - uref||_R^2 + ||u - u_last||_{Rdu}^2
+      Terminal cost: ||x_N - xref_N||_Q^2
+      Constraints: friction pyramid + fz upper bound via general ineq;
+                   stance fz_min & swing u=0 via per-stage box bounds.
     """
 
     def __init__(
         self,
         mass: float,
-        inertia: np.ndarray,  # 3x3 body-frame inertia
+        inertia: np.ndarray,
         N: int,
         dt: float,
         g: float = 9.81,
         mu: float = 1.0,
         fz_min: float = 0.0,
         fz_max: float = 1e3,
-        Qp: np.ndarray | float = 1.0,
-        Qv: np.ndarray | float = 10.0,
-        Qt: np.ndarray | float = 1.0,
-        Qw: np.ndarray | float = 10.0,
-        Rf: float = 1e-3,
+        Qp: np.ndarray | float = (200.0, 200.0, 200.0),
+        Qv: np.ndarray | float = (250.0, 250.0, 250.0),
+        Qt: np.ndarray | float = (300.0, 200.0, 300.0),
+        Qw: np.ndarray | float = (200.0, 200.0, 100.0),
+        Rf: float | np.ndarray = None,
+        Rdu: float | np.ndarray = None,
     ):
+        # plant
         self.m = float(mass)
-        self.Ib = np.array(inertia, dtype=float)
+        self.Ib = np.array(inertia, dtype=float)   # 3x3 body-frame inertia at CoM
         self.N = int(N)
-        # IMPORTANT: use the dt passed in — do not override from a global config
         self.dt = float(dt)
-        self.gvec = np.array([0.0, 0.0, -float(g)], dtype=float)
+        self.Tf = self.N * self.dt
+        self.g = float(g)
+        self.gvec = np.array([0.0, 0.0, -self.g])
         self.mu = float(mu)
         self.fz_min = float(fz_min)
         self.fz_max = float(fz_max)
 
-        # weights (3x3 each if arrays; else scalar*I)
-        self.Qp = np.eye(3)*Qp if np.isscalar(Qp) else np.array(Qp, dtype=float)
-        self.Qv = np.eye(3)*Qv if np.isscalar(Qv) else np.array(Qv, dtype=float)
-        self.Qt = np.eye(3)*Qt if np.isscalar(Qt) else np.array(Qt, dtype=float)
-        self.Qw = np.eye(3)*Qw if np.isscalar(Qw) else np.array(Qw, dtype=float)
-        self.Rf = float(Rf)
+        # weights (anisotropic on forces so fx,fy can develop)
+        self.Qp, self.Qv, self.Qt, self.Qw = Qp, Qv, Qt, Qw
+        if Rf is None:
+            Rf = np.kron(np.eye(4), np.diag([1e-6, 1e-6, 5e-4]))
+        if Rdu is None:
+            # slightly stronger Δu penalty on fz (stabilize contact transitions)
+            Rdu = np.kron(np.eye(4), np.diag([2e-7, 2e-7, 5e-4]))
+        self.Rf, self.Rdu = Rf, Rdu
 
-        # OSQP workspace (reused)
-        self._osqp = osqp.OSQP()
-        self._is_warm = False
+        self.u_last = None  # Δu anchor
+        self._cmd_prev = {"vx": 0.0, "vy": 0.0, "yr": 0.0}  # for optional slew-limit
 
-        # (kept for parity if you re-enable scaling later)
-        self.initial_base_position = np.zeros(3)
+        # ---------------- Build dynamics x+ = A(psi) x + B(psi,r,pbar) u + c ----------------
+        nx, nu = 12, 12
+        x = MX.sym("x", nx)          # [p, v, theta, omega]
+        u = MX.sym("u", nu)          # GRFs stacked
 
+        # per-stage params
+        pbar = MX.sym("pbar", 3)     # reference CoM for moment arms
+        Iinv = MX.sym("Iinv", 3, 3)  # world-frame inverse inertia (from yaw)
+        rFL = MX.sym("rFL", 3); rFR = MX.sym("rFR", 3)
+        rRL = MX.sym("rRL", 3); rRR = MX.sym("rRR", 3)
+        psi = MX.sym("psi")          # yaw angle parameter
 
-    def set_weight(self, nx: int = 12, nu: int = 12):
-        """
-        Minimal weights for convex centroidal MPC.
-        State order: [p(3), v(3), theta(3), omega(3)]  -> Q is (12x12)
-        Control:     [FL(3), FR(3), RL(3), RR(3)]      -> R is (12x12)
+        dt = self.dt
 
-        Returns:
-            Q (12x12), R (12x12)
-        """
-        import numpy as np
-
-        # --- State weights (your numbers) ---
-        # Q_position          = np.array([   0.0,    0.0, 1500.0])  # x,y,z
-        # Q_velocity          = np.array([ 200.0,  200.0,  200.0])  # vx,vy,vz
-        # Q_base_angle        = np.array([ 500.0,  500.0,    0.0])  # roll,pitch,yaw
-        # Q_base_angle_rates  = np.array([  20.0,   20.0,   50.0])  # wx,wy,wz
-
-        Q_position          = np.array([   0.0,    0.0, 1000.0])  # x,y,z
-        Q_velocity          = np.array([ 1000.0,  1000.0,  1000.0])  # vx,vy,vz
-        Q_base_angle        = np.array([ 500.0,  500.0,    0.0])  # roll,pitch,yaw
-        Q_base_angle_rates  = np.array([  20.0,   20.0,   1000.0])  # wx,wy,wz
-
-        Q = np.diag(
-            np.concatenate([Q_position, Q_velocity, Q_base_angle, Q_base_angle_rates]).astype(float)
+        # yaw rotation
+        cz, sz = cos(psi), sin(psi)
+        Rz = vertcat(
+            horzcat( cz, -sz, 0),
+            horzcat( sz,  cz, 0),
+            horzcat(  0,   0, 1)
         )
 
-        # --- Control (force) weights per foot axis ---
-        R_per_leg = np.diag([1e-3, 1e-3, 1e-3])       # fx, fy, fz
-        R = np.kron(np.eye(4), R_per_leg)             # 4 feet -> (12x12)
+        # A(psi): rows [p; v; theta; omega], cols in same order
+        A_row_p     = horzcat(MX.eye(3),    dt*MX.eye(3), MX.zeros(3,3),       MX.zeros(3,3))
+        A_row_v     = horzcat(MX.zeros(3,3), MX.eye(3),   MX.zeros(3,3),       MX.zeros(3,3))
+        A_row_theta = horzcat(MX.zeros(3,3), MX.zeros(3,3), MX.eye(3),         dt*Rz.T)
+        A_row_omega = horzcat(MX.zeros(3,3), MX.zeros(3,3), MX.zeros(3,3),     MX.eye(3))
+        A = vertcat(A_row_p, A_row_v, A_row_theta, A_row_omega)
 
-        # (Optional) sanity checks
-        assert Q.shape == (nx, nx), f"Q must be {nx}x{nx}, got {Q.shape}"
-        assert R.shape == (nu, nu), f"R must be {nu}x{nu}, got {R.shape}"
+        # c = [0; dt*g; 0; 0]
+        c = MX(np.concatenate([np.zeros(3), dt*self.gvec, np.zeros(3), np.zeros(3)]))
 
-        return Q, R
+        # helper: skew matrix S(a) so S(a)@b = a × b
+        def _skew(a: MX) -> MX:
+            ax, ay, az = a[0], a[1], a[2]
+            row1 = horzcat( MX(0), -az,    ay)
+            row2 = horzcat(  az,   MX(0), -ax)
+            row3 = horzcat( -ay,    ax,   MX(0))
+            return vertcat(row1, row2, row3)
 
-    # ---- internal helpers ----
-    def _build_selection(self, contacts_k):
-        """Return a diagonal block selector S_k (12x12) that zeros swing leg forces at stage k."""
-        S = np.zeros((12, 12))
-        for i, _ in enumerate(_LEG_ORDER):
-            on = 1.0 if contacts_k[i] else 0.0
-            S[3*i:3*i+3, 3*i:3*i+3] = on*np.eye(3)
-        return S
+        # per-leg B block with state order [p; v; theta; omega]
+        def _leg_block(arm: MX) -> MX:
+            Bp     = MX.zeros(3,3)
+            Bv     = (dt / self.m) * MX.eye(3)
+            Btheta = MX.zeros(3,3)
+            Bomega = dt * (Iinv @ _skew(arm))
+            return vertcat(Bp, Bv, Btheta, Bomega)
 
-    def _R_from_euler(self, euler_xyz):
-        """
-        Return Rz(yaw) only (MIT convex simplification).
-        The inputs are (roll, pitch, yaw); we only use yaw.
-        """
-        rx, ry, rz = euler_xyz
-        cz, sz = np.cos(rz), np.sin(rz)
-        Rz = np.array([[cz,-sz,0],
-                       [sz, cz,0],
-                       [ 0,  0,1]])
-        return Rz
+        aFL = rFL - pbar
+        aFR = rFR - pbar
+        aRL = rRL - pbar
+        aRR = rRR - pbar
+        B = horzcat(_leg_block(aFL), _leg_block(aFR),
+                    _leg_block(aRL), _leg_block(aRR))
 
-    def _friction_pyramid_blocks(self, S: np.ndarray):
-        """
-        Build inequality rows for a single stage (12 force vars):
-            -mu*fz <= fx <=  mu*fz
-            -mu*fz <= fy <=  mu*fz
-            fz_min <= fz <= fz_max
-        The selector S (12x12) zeroes swing-leg forces.
-        Returns:
-            A_ineq: (5*4, 12)   l: (5*4,)   u: (5*4,)
-        """
+        # register model
+        model = AcadosModel()
+        model.name = "centroidal_mpc_qp_mit_yawA"
+        model.x = x
+        model.u = u
+        # params: pbar(3) + rFL(3)+rFR(3)+rRL(3)+rRR(3) + vec(Iinv)(9) + psi(1) = 25
+        model.p = vertcat(pbar, rFL, rFR, rRL, rRR, reshape(Iinv, 9, 1), psi)
+        model.disc_dyn_expr = A @ x + B @ u + c
+        self.model = model
+
+        # ---------------- OCP/QP ----------------
+        ocp = AcadosOcp()
+        ocp.model = model
+
+        ocp.dims.nx = nx
+        ocp.dims.nu = nu
+        ocp.dims.ny = nx + 2 * nu     # [x; u; u_last]
+        ocp.dims.ny_e = nx
+        ocp.dims.np = 25
+
+        ocp.solver_options.N_horizon = self.N
+        ocp.solver_options.tf = float(self.Tf)
+        ocp.parameter_values = np.zeros(25)
+
+        # Costs
+        Q, R, Rdu = self._build_weights()
+        ocp.cost.cost_type = "LINEAR_LS"
+        ocp.cost.cost_type_e = "LINEAR_LS"
+        ocp.cost.W   = sparse.block_diag([Q, R, Rdu]).toarray()
+        ocp.cost.W_e = Q
+
+        Vx = np.zeros((nx + 2*nu, nx))
+        Vu = np.zeros((nx + 2*nu, nu))
+        Vx[0:nx, 0:nx] = np.eye(nx)
+        Vu[nx:nx+nu, :] = np.eye(nu)
+        Vu[nx+nu:,   :] = np.eye(nu)
+        ocp.cost.Vx = Vx
+        ocp.cost.Vu = Vu
+        ocp.cost.Vx_e = np.eye(nx)
+        ocp.cost.yref = np.zeros(nx + 2*nu)
+        ocp.cost.yref_e = np.zeros(nx)
+
+        # --- Global general inequalities: friction pyramid + fz upper bound ONLY ---
+        # IMPORTANT: do NOT put fz_min here; handle stance fz_min via per-stage box-bounds.
         mu = self.mu
-        A_rows, l, u = [], [], []
+        A_ineq = []
+        lg, ug = [], []
         for i in range(4):
-            row_fx_le_mu_fz = np.zeros((1, 12)); row_fx_le_mu_fz[:, 3*i:3*i+3] = np.array([[ 1.0,  0.0, -mu]])
-            row_fx_ge_mn_mu = np.zeros((1, 12)); row_fx_ge_mn_mu[:, 3*i:3*i+3] = np.array([[-1.0,  0.0, -mu]])
-            row_fy_le_mu_fz = np.zeros((1, 12)); row_fy_le_mu_fz[:, 3*i:3*i+3] = np.array([[ 0.0,  1.0, -mu]])
-            row_fy_ge_mn_mu = np.zeros((1, 12)); row_fy_ge_mn_mu[:, 3*i:3*i+3] = np.array([[ 0.0, -1.0, -mu]])
-            row_fz_bounds   = np.zeros((1, 12)); row_fz_bounds[:,   3*i:3*i+3] = np.array([[ 0.0,  0.0,  1.0]])
-            # zero-out swing legs
-            row_fx_le_mu_fz = row_fx_le_mu_fz @ S
-            row_fx_ge_mn_mu = row_fx_ge_mn_mu @ S
-            row_fy_le_mu_fz = row_fy_le_mu_fz @ S
-            row_fy_ge_mn_mu = row_fy_ge_mn_mu @ S
-            row_fz_bounds   = row_fz_bounds   @ S
-            A_rows.extend([row_fx_le_mu_fz, row_fx_ge_mn_mu, row_fy_le_mu_fz, row_fy_ge_mn_mu, row_fz_bounds])
-            l.extend([-np.inf, -np.inf, -np.inf, -np.inf, self.fz_min])
-            u.extend([0.0,      0.0,     0.0,     0.0,     self.fz_max])
-        A_ineq = np.vstack(A_rows)
-        return A_ineq, np.asarray(l, dtype=float), np.asarray(u, dtype=float)
+            blk = np.zeros((5, 12))
+            blk[0, 3*i:3*i+3] = [ 1,  0, -mu]  #  fx - mu fz <= 0
+            blk[1, 3*i:3*i+3] = [-1,  0, -mu]  # -fx - mu fz <= 0
+            blk[2, 3*i:3*i+3] = [ 0,  1, -mu]  #  fy - mu fz <= 0
+            blk[3, 3*i:3*i+3] = [ 0, -1, -mu]  # -fy - mu fz <= 0
+            blk[4, 3*i:3*i+3] = [ 0,  0,  1]   #  fz <= fz_max
+            A_ineq.append(blk)
+            lg.extend([-1e8, -1e8, -1e8, -1e8, -1e8])    # no lower bounds here
+            ug.extend([0.0,   0.0,   0.0,   0.0, self.fz_max])
+        A_ineq = np.vstack(A_ineq).astype(float)
+        ocp.dims.ng = A_ineq.shape[0]
+        ocp.constraints.C  = np.zeros((ocp.dims.ng, nx), dtype=float)
+        ocp.constraints.D  = A_ineq
+        ocp.constraints.lg = np.asarray(lg, dtype=float)
+        ocp.constraints.ug = np.asarray(ug, dtype=float)
 
-    def _feet_refs_over_horizon(self, ref_state, contacts):
-        """
-        Build per-stage foot references r_i[k] (i in {FL,FR,RL,RR}), size (N,4,3).
-        Uses the stepping rule: advance leg's waypoint when it transitions stance->swing.
-        """
+        # Box bounds for u (swing legs set to 0 per stage; stance fz_min via box)
+        ocp.dims.nbu = nu
+        ocp.constraints.idxbu = np.arange(nu, dtype=np.int32)
+        ocp.constraints.lbu = -1e8 * np.ones(nu)
+        ocp.constraints.ubu =  1e8 * np.ones(nu)
+
+        # Initial state equality x(0) = measured
+        ocp.dims.nbx_0 = nx
+        ocp.constraints.idxbx_0 = np.arange(nx, dtype=np.int32)
+        ocp.constraints.lbx_0 = np.zeros(nx)
+        ocp.constraints.ubx_0 = np.zeros(nx)
+
+        ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
+        ocp.solver_options.integrator_type = "DISCRETE"
+        ocp.solver_options.nlp_solver_type = "SQP_RTI"
+
+        self.ocp = ocp
+        self.solver = AcadosOcpSolver(ocp, json_file="centroidal_qp_mit_yawA.json")
+
+    # ---------- utilities ----------
+    def _as_mat(self, val, n):
+        if np.isscalar(val): return np.eye(n) * float(val)
+        A = np.array(val, dtype=float)
+        if A.shape == (n,):  return np.diag(A)
+        if A.shape == (n, n): return A
+        raise ValueError(f"Weight must be scalar, len-{n} vector, or {n}x{n}; got {A.shape}")
+
+    def _build_weights(self, nx=12, nu=12):
+        Qp = self._as_mat(self.Qp, 3)
+        Qv = self._as_mat(self.Qv, 3)
+        Qt = self._as_mat(self.Qt, 3)
+        Qw = self._as_mat(self.Qw, 3)
+        Q = sparse.block_diag([Qp, Qv, Qt, Qw]).toarray()
+
+        R = self.Rf
+        if np.isscalar(R):
+            R = np.kron(np.eye(4), np.eye(3) * float(R))
+        else:
+            R = np.array(R, dtype=float)
+            if R.shape == (3, 3):       R = np.kron(np.eye(4), R)
+            elif R.shape == (12, 12):   pass
+            else: raise ValueError(f"Rf must be scalar, 3x3, or 12x12; got {R.shape}")
+
+        Rdu = self.Rdu
+        if np.isscalar(Rdu):
+            Rdu = np.kron(np.eye(4), np.eye(3) * float(Rdu))
+        else:
+            Rdu = np.array(Rdu, dtype=float)
+            if Rdu.shape == (3, 3):       Rdu = np.kron(np.eye(4), Rdu)
+            elif Rdu.shape == (12, 12):   pass
+            else: raise ValueError(f"Rdu must be scalar, 3x3, or 12x12; got {Rdu.shape}")
+
+        return Q, np.array(R, float), np.array(Rdu, float)
+
+    def _R_from_euler_xyz(self, euler_xyz):
+        rx, ry, rz = euler_xyz
+        cx, sx = np.cos(rx), np.sin(rx)
+        cy, sy = np.cos(ry), np.sin(ry)
+        cz, sz = np.cos(rz), np.sin(rz)
+        Rx = np.array([[1,0,0],[0,cx,-sx],[0,sx,cx]])
+        Ry = np.array([[cy,0,sy],[0,1,0],[-sy,0,cy]])
+        Rz = np.array([[cz,-sz,0],[sz,cz,0],[0,0,1]])
+        return Rz @ Ry @ Rx   # intrinsic XYZ
+
+    def _contacts_to_4xN(self, contact_sequence):
+        arr = np.array(contact_sequence, dtype=int)
+        if arr.shape == (self.N, 4): arr = arr.T
+        assert arr.shape == (4, self.N), f"contact_sequence must be (4,N) or (N,4); got {arr.shape}"
+        return arr
+
+    def _feet_refs_over_horizon(self, ref_state, contacts4xN):
         N = self.N
-        rFL_all = np.atleast_2d(np.array(ref_state["ref_foot_FL"], dtype=float))
-        rFR_all = np.atleast_2d(np.array(ref_state["ref_foot_FR"], dtype=float))
-        rRL_all = np.atleast_2d(np.array(ref_state["ref_foot_RL"], dtype=float))
-        rRR_all = np.atleast_2d(np.array(ref_state["ref_foot_RR"], dtype=float))
-
-        FLc = contacts[0, :].astype(int)
-        FRc = contacts[1, :].astype(int)
-        RLc = contacts[2, :].astype(int)
-        RRc = contacts[3, :].astype(int)
-
+        rFL_all = np.atleast_2d(ref_state["ref_foot_FL"])
+        rFR_all = np.atleast_2d(ref_state["ref_foot_FR"])
+        rRL_all = np.atleast_2d(ref_state["ref_foot_RL"])
+        rRR_all = np.atleast_2d(ref_state["ref_foot_RR"])
         idx = np.array([0, 0, 0, 0], dtype=int)
-        r_over_h = np.zeros((N, 4, 3), dtype=float)
-
+        r_over_h = np.zeros((N, 4, 3))
+        FLc, FRc, RLc, RRc = contacts4xN[0], contacts4xN[1], contacts4xN[2], contacts4xN[3]
         for j in range(N):
-            r_over_h[j, 0, :] = rFL_all[min(idx[0], rFL_all.shape[0]-1)]
-            r_over_h[j, 1, :] = rFR_all[min(idx[1], rFR_all.shape[0]-1)]
-            r_over_h[j, 2, :] = rRL_all[min(idx[2], rRL_all.shape[0]-1)]
-            r_over_h[j, 3, :] = rRR_all[min(idx[3], rRR_all.shape[0]-1)]
+            r_over_h[j,0] = rFL_all[min(idx[0], rFL_all.shape[0]-1)]
+            r_over_h[j,1] = rFR_all[min(idx[1], rFR_all.shape[0]-1)]
+            r_over_h[j,2] = rRL_all[min(idx[2], rRL_all.shape[0]-1)]
+            r_over_h[j,3] = rRR_all[min(idx[3], rRR_all.shape[0]-1)]
+            if j < N-1:
+                if FLc[j]==1 and FLc[j+1]==0 and idx[0]+1<rFL_all.shape[0]: idx[0]+=1
+                if FRc[j]==1 and FRc[j+1]==0 and idx[1]+1<rFR_all.shape[0]: idx[1]+=1
+                if RLc[j]==1 and RLc[j+1]==0 and idx[2]+1<rRL_all.shape[0]: idx[2]+=1
+                if RRc[j]==1 and RRc[j+1]==0 and idx[3]+1<rRR_all.shape[0]: idx[3]+=1
+        return r_over_h
 
-            if j < N-1:  # advance after assignment if stance->swing at next step
-                if FLc[j] == 1 and FLc[j+1] == 0 and idx[0] + 1 < rFL_all.shape[0]: idx[0] += 1
-                if FRc[j] == 1 and FRc[j+1] == 0 and idx[1] + 1 < rFR_all.shape[0]: idx[1] += 1
-                if RLc[j] == 1 and RLc[j+1] == 0 and idx[2] + 1 < rRL_all.shape[0]: idx[2] += 1
-                if RRc[j] == 1 and RRc[j+1] == 0 and idx[3] + 1 < rRR_all.shape[0]: idx[3] += 1
+    def _build_u_ref_mg_split(self, contacts4xN):
+        N = self.N
+        u_ref = np.zeros((N, 12))
+        for k in range(N):
+            n_stance = int(contacts4xN[:, k].sum())
+            if n_stance <= 0:
+                continue
+            fz = self.m * self.g / n_stance
+            for i in range(4):
+                if contacts4xN[i, k] == 1:
+                    u_ref[k, 3*i:3*i+3] = [0.0, 0.0, fz]
+        return u_ref
 
-        return r_over_h  # (N,4,3)
-
-    def _stack_dynamics_maps(self, p0, v0, w0, r_over_h, contacts, Iinv_world):
+    # ---------- main solve ----------
+    def compute_control(self, state_current, ref_state, contact_sequence):
         """
-        Build affine maps from stacked forces to linear and angular rates over the horizon:
-
-           v_{k+1}     = v0 + dt*(k+1)*g + (dt/m) * sum_{j=0..k} sum_i f_{i,j}
-           omega_{k+1} = w0 + dt * sum_{j=0..k} I^{-1} * sum_i ( (r_i[j] - p0) x f_{i,j} )
-
         Returns:
-            Bv, Bw: (3N x 12N) maps
-            gv, gw: (3N,) offsets
-            S_block: (12N x 12N) contact selection block-diag
+            nmpc_GRFs: (12,) GRFs at k=0
+            nmpc_footholds: (4,3) foot positions at stage 0
+            nmpc_predicted_state: dict with 'x_traj' (N+1,12)
         """
         N = self.N
         dt = self.dt
-        m  = self.m
-        Iinv = Iinv_world
 
-        # Build stacked contact selector S (12N x 12N)
-        S_block = sparse.block_diag([self._build_selection(contacts[:, k]) for k in range(N)]).toarray()
+        p0 = np.array(state_current["position"]).reshape(3)
+        v0 = np.array(state_current["linear_velocity"]).reshape(3)
+        w0 = np.array(state_current["angular_velocity"]).reshape(3)
+        theta0 = np.array(state_current.get("orientation", np.zeros(3))).reshape(3)
 
-        # Pre-allocate block rows
-        Bv_blocks, Bw_blocks = [], []
-        gv_list, gw_list = [], []
+        # ---------- Extract commanded (vx, vy, yawrate, z) from ref_state ----------
+        # Preferred keys: cmd_vxy / cmd_yawrate / cmd_z
+        if "cmd_vxy" in ref_state:
+            vx_cmd, vy_cmd = ref_state["cmd_vxy"]
+        else:
+            vref_in = np.array(ref_state["ref_linear_velocity"]).reshape(-1, 3)
+            vx_cmd, vy_cmd = vref_in[0, 0], vref_in[0, 1]
 
-        # Linear "sum over feet" map for a single stage: [I I I I]
-        Sv_allfeet = np.zeros((3, 12))
-        eye3 = np.eye(3)
-        for i in range(4):
-            Sv_allfeet[:, 3*i:3*i+3] = eye3
+        if "cmd_yawrate" in ref_state:
+            yawrate_cmd = float(ref_state["cmd_yawrate"])
+        else:
+            wref_in = np.array(ref_state["ref_angular_velocity"]).reshape(-1, 3)
+            yawrate_cmd = float(wref_in[0, 2])
 
+        if "cmd_z" in ref_state:
+            z_cmd = float(ref_state["cmd_z"])
+        else:
+            if "ref_position" in ref_state:
+                pref_in = np.array(ref_state["ref_position"]).reshape(-1, 3)
+                z_cmd = float(pref_in[0, 2])
+            else:
+                z_cmd = float(p0[2])
+
+        # Optional command slew limits (operator-level accel limits)
+        a_max_xy, a_max_yaw = 1.5, 2.0
+        def slew(prev, target, rate):
+            step = np.clip(target - prev, -rate*dt, rate*dt)
+            return prev + step
+        vx_cmd = slew(self._cmd_prev["vx"], vx_cmd, a_max_xy)
+        vy_cmd = slew(self._cmd_prev["vy"], vy_cmd, a_max_xy)
+        yawrate_cmd = slew(self._cmd_prev["yr"], yawrate_cmd, a_max_yaw)
+        self._cmd_prev = {"vx": vx_cmd, "vy": vy_cmd, "yr": yawrate_cmd}
+
+        # Piecewise-constant (vx,vy,yawrate); integrate to p and yaw
+        vref = np.tile(np.array([vx_cmd, vy_cmd, 0.0]), (N, 1))
+        wref = np.tile(np.array([0.0, 0.0, yawrate_cmd]), (N, 1))
+        pref = np.zeros((N, 3))
+        oref = np.zeros((N, 3))  # [roll, pitch, yaw]
+        pref[0] = np.array([p0[0], p0[1], z_cmd])
+        oref[0] = np.array([0.0, 0.0, theta0[2]])
+        for k in range(N-1):
+            pref[k+1] = pref[k] + dt * vref[k]
+            oref[k+1] = oref[k] + dt * wref[k]
+
+        # ---------- contact plan & footholds ----------
+        contacts = self._contacts_to_4xN(contact_sequence)
+        feet_over_h = self._feet_refs_over_horizon(ref_state, contacts)
+
+        # input references: split mg across stance feet
+        u_ref = self._build_u_ref_mg_split(contacts)
+
+        # per-stage Iinv from yaw
+        Iinv_all = []
         for k in range(N):
-            row_blocks_v, row_blocks_w = [], []
-            for j in range(N):
-                if j <= k:
-                    Sv = Sv_allfeet
-                    Sw = np.zeros((3, 12))
-                    for i in range(4):
-                        arm = r_over_h[j, i, :] - p0
-                        Sw[:, 3*i:3*i+3] = _skew(arm)
+            psi_k = oref[k, 2]
+            cz, sz = np.cos(psi_k), np.sin(psi_k)
+            Rz = np.array([[cz, -sz, 0],
+                           [sz,  cz, 0],
+                           [ 0,   0, 1]])
+            Iw = Rz @ self.Ib @ Rz.T
+            Iinv_all.append(np.linalg.inv(Iw))
+        Iinv_all = np.array(Iinv_all)
+
+        # Δu anchor
+        if self.u_last is None:
+            u0_last = np.zeros(12)
+            n_stance0 = int(contacts[:, 0].sum())
+            if n_stance0 > 0:
+                fz = self.m * self.g / n_stance0
+                for i in range(4):
+                    if contacts[i, 0] == 1:
+                        u0_last[3*i:3*i+3] = [0.0, 0.0, fz]
+            self.u_last = u0_last
+        u_last = self.u_last.copy()
+
+        # ---------- costs ----------
+        nx, nu = 12, 12
+        for k in range(N):
+            xref_k = np.concatenate([pref[k], vref[k], oref[k], wref[k]])
+            yk = np.concatenate([xref_k, u_ref[k], u_last])
+            self.solver.set(k, "yref", yk.astype(float))
+        yN = np.concatenate([pref[-1], vref[-1], oref[-1], wref[-1]])
+        self.solver.set(N, "yref", yN.astype(float))  # terminal via yref at stage N
+
+        # initial state equality + warm start baseline
+        x0 = np.concatenate([p0, v0, theta0, w0]).astype(float)
+        self.solver.set(0, "lbx", x0)
+        self.solver.set(0, "ubx", x0)
+        self.solver.set(0, "x", x0)
+
+        # ---------- parameters & per-stage box bounds ----------
+        for k in range(N):
+            rFL, rFR, rRL, rRR = feet_over_h[k]
+            pbar = pref[k]
+            psi_k = float(oref[k, 2])
+            Iinv = Iinv_all[k]
+            params = np.concatenate([pbar, rFL, rFR, rRL, rRR, Iinv.reshape(-1), [psi_k]])
+            self.solver.set(k, "p", params)
+
+            # Box bounds on u
+            lbu = -1e8 * np.ones(12)
+            ubu =  1e8 * np.ones(12)
+            for i in range(4):
+                idx = 3*i
+                if contacts[i, k] == 0:
+                    # swing: clamp all three components to zero
+                    lbu[idx:idx+3] = 0.0
+                    ubu[idx:idx+3] = 0.0
                 else:
-                    Sv = np.zeros((3, 12))
-                    Sw = np.zeros((3, 12))
-                row_blocks_v.append((dt/m) * Sv)
-                row_blocks_w.append(dt * (Iinv @ Sw))
+                    # stance: fx,fy wide; enforce fz in [fz_min, fz_max]
+                    lbu[idx+2] = self.fz_min
+                    ubu[idx+2] = self.fz_max
+            self.solver.set(k, "lbu", lbu)
+            self.solver.set(k, "ubu", ubu)
 
-            Bv_blocks.append(np.hstack(row_blocks_v))  # 3 x (12N)
-            Bw_blocks.append(np.hstack(row_blocks_w))  # 3 x (12N)
-
-            gv_list.append(v0 + (k+1)*dt*self.gvec)  # gravity accumulation
-            gw_list.append(w0)
-
-        Bv = np.vstack(Bv_blocks)  # (3N x 12N)
-        Bw = np.vstack(Bw_blocks)  # (3N x 12N)
-
-        # Apply contact selection (zeros swing forces)
-        Bv = Bv @ S_block
-        Bw = Bw @ S_block
-
-        gv = np.hstack(gv_list)    # (3N,)
-        gw = np.hstack(gw_list)    # (3N,)
-
-        return Bv, Bw, gv, gw, S_block
-
-    # ---- main API ----
-    def compute_control(self, state_current, ref_state, contact_sequence, inertia=None):
-        """
-        Keys follow Acados_NMPC_Nominal:
-        state_current:
-            - position            : (3,)
-            - linear_velocity     : (3,)
-            - angular_velocity    : (3,)
-            - orientation         : (3,)  # roll, pitch, yaw
-        ref_state:
-            - ref_position        : (N x 3) or (1 x 3)
-            - ref_linear_velocity : (N x 3) or (1 x 3)
-            - ref_orientation     : (N x 3) or (1 x 3)
-            - ref_angular_velocity: (N x 3) or (1 x 3)
-            - ref_foot_FL, ref_foot_FR, ref_foot_RL, ref_foot_RR : (T_i x 3), WORLD frame
-        contact_sequence: (4 x N) array of {0,1}
-        Returns:
-            f0: (12,) forces at k=0 (fx,fy,fz for FL,FR,RL,RR)
-            footholds: list of 4 (3,) foot world positions at stage 0
-            pred: (N+1, 12) [p, v, theta, omega]
-        """
-        N = self.N
-        dt = self.dt
-
-        # --- unpack current state ---
-        p0 = np.array(state_current["position"], dtype=float).reshape(3)
-        v0 = np.array(state_current["linear_velocity"], dtype=float).reshape(3)
-        w0 = np.array(state_current["angular_velocity"], dtype=float).reshape(3)
-        theta0 = np.array(state_current.get("orientation", np.zeros(3)), dtype=float).reshape(3)
-
-        # Helper to tile/clip to horizon
-        def _horizonize(x):
-            arr = np.array(x, dtype=float).reshape(-1, 3)
-            if arr.shape[0] == 1:
-                arr = np.tile(arr, (N, 1))
-            elif arr.shape[0] < N:
-                tail = np.repeat(arr[-1:, :], N - arr.shape[0], axis=0)
-                arr = np.vstack([arr, tail])
-            return arr[:N, :]
-
-        pref  = _horizonize(ref_state.get("ref_position", np.array(p0)[None, :]))
-        vref  = _horizonize(ref_state["ref_linear_velocity"])
-        oref  = _horizonize(ref_state.get("ref_orientation", np.array(theta0)[None, :]))
-        wref  = _horizonize(ref_state["ref_angular_velocity"])
-
-        contacts = np.array(contact_sequence, dtype=float)  # (4, N)
-
-        # Map inertia to WORLD using yaw0 only (MIT convex simplification)
-        Rz = self._R_from_euler(theta0)      # uses yaw component only
-        I_world0 = Rz @ self.Ib @ Rz.T
-        I_world0_inv = np.linalg.inv(I_world0)
-
-        # Per-stage foot references (N,4,3) in WORLD
-        r_over_h = self._feet_refs_over_horizon(ref_state, contacts)
-
-        # --- build v, omega maps (core dynamics) ---
-        Bv, Bw, gv, gw, S_block = self._stack_dynamics_maps(p0, v0, w0, r_over_h, contacts, I_world0_inv)
-        Bv_s = sparse.csc_matrix(Bv)
-        Bw_s = sparse.csc_matrix(Bw)
-
-        # --- integrate to get position (p) and orientation (theta) maps ---
-        # Strictly-lower block accumulator C (row k sums cols 0..k-1).
-        I3 = np.eye(3)
-        C_blocks = []
+        # ---------- warm-start u with u_ref ----------
         for k in range(N):
-            row_blocks = []
-            for j in range(N):
-                row_blocks.append(I3 if j < k else np.zeros((3,3)))
-            C_blocks.append(np.hstack(row_blocks))
-        C_s = sparse.csc_matrix(np.vstack(C_blocks))  # (3N x 3N)
-        oneN = np.ones((N,1))
+            self.solver.set(k, "u", u_ref[k])
 
-        # Stacked references
-        Pref = pref.reshape(3*N)
-        Vref = vref.reshape(3*N)
-        Oref = oref.reshape(3*N)
-        Wref = wref.reshape(3*N)
-
-        # p map: Pstack = (dt*C)* (Bv F + gv) + kron(1_N, p0)
-        Bp_s = (self.dt * C_s) @ Bv_s
-        gp = self.dt * (C_s @ gv)               # integrate gv
-        gp = np.asarray(gp).reshape(3*N) + np.kron(oneN, p0).reshape(3*N)
-
-        # theta map: Tstack = (dt*C)* (Bw F + gw) + kron(1_N, theta0)
-        Btheta_s = (self.dt * C_s) @ Bw_s
-        gtheta = self.dt * (C_s @ gw)           # integrate gw
-        gtheta = np.asarray(gtheta).reshape(3*N) + np.kron(oneN, theta0).reshape(3*N)
-
-        # === Build force reference from contact schedule (fx=fy=0; fz = mg / #stance) ===
-        g_mag = float(abs(self.gvec[2]))
-        m = self.m
-        Fref_list = []
+        # ---------- warm-start x by rolling model with u_ref ----------
+        def _skew_np(a):
+            return np.array([[0, -a[2], a[1]],
+                             [a[2], 0, -a[0]],
+                             [-a[1], a[0], 0]])
+        xk = x0.copy()
+        self.solver.set(0, "x", xk)
         for k in range(N):
-            c = contacts[:, k].astype(float)  # [FL, FR, RL, RR] in {0,1}
-            legs_in_stance = int(c.sum())
-            fz_each = (m * g_mag / legs_in_stance) if legs_in_stance > 0 else 0.0
-            f_FL = np.array([0.0, 0.0, fz_each * c[0]])
-            f_FR = np.array([0.0, 0.0, fz_each * c[1]])
-            f_RL = np.array([0.0, 0.0, fz_each * c[2]])
-            f_RR = np.array([0.0, 0.0, fz_each * c[3]])
-            Fref_list.append(np.hstack([f_FL, f_FR, f_RL, f_RR]))
-        Fref = np.hstack(Fref_list)  # (12*N,)
+            psi_k = float(oref[k, 2])
+            cz, sz = np.cos(psi_k), np.sin(psi_k)
+            Rz = np.array([[cz, -sz, 0],
+                           [sz,  cz, 0],
+                           [ 0,   0, 1]])
+            # A_k numeric
+            A_k = np.eye(12)
+            A_k[0:3, 3:6]   = dt * np.eye(3)
+            A_k[6:9, 9:12]  = dt * Rz.T
+            # B_k numeric
+            rFL, rFR, rRL, rRR = feet_over_h[k]
+            pbar = pref[k]
+            arms = [rFL - pbar, rFR - pbar, rRL - pbar, rRR - pbar]
+            Iinv = Iinv_all[k]
+            B_k = np.zeros((12, 12))
+            for i_leg, arm in enumerate(arms):
+                B_k[3:6, 3*i_leg:3*i_leg+3]  = (dt / self.m) * np.eye(3)
+                B_k[9:12, 3*i_leg:3*i_leg+3] = dt * (Iinv @ _skew_np(arm))
+            c_k = np.concatenate([np.zeros(3), dt*self.gvec, np.zeros(3), np.zeros(3)])
+            xk = A_k @ xk + B_k @ u_ref[k] + c_k
+            self.solver.set(k+1, "x", xk)
 
-        # === Stacked state map: x_stack = Sx * F + gx ===
-        # Order matches state: [p(3N); v(3N); theta(3N); omega(3N)]
-        Sx_s = sparse.vstack([Bp_s, Bv_s, Btheta_s, Bw_s], format="csc")  # (12N x 12N)
-        gx   = np.hstack([gp,    gv,    gtheta,    gw   ])                # (12N,)
-        Xref = np.hstack([Pref,  Vref,  Oref,      Wref ])                # (12N,)
+        # ---------- solve ----------
+        status = self.solver.solve()
+        if status != 0:
+            print(f"[Acados/QP] solver failed with status {status}, returning zeros")
+            return np.zeros(12), feet_over_h[0], {"x_traj": np.zeros((N+1, 12))}
 
-        # === Weights from your simple setter ===
-        Q_state12, R_force12 = self.set_weight(nx=12, nu=12)
-        Q_big = sparse.kron(sparse.eye(N, format="csc"), sparse.csc_matrix(Q_state12), format="csc")  # (12N x 12N)
-        R_big = sparse.kron(sparse.eye(N, format="csc"), sparse.csc_matrix(R_force12), format="csc")  # (12N x 12N)
+        u0 = np.array(self.solver.get(0, "u")).reshape(-1)
+        feet0 = feet_over_h[0].copy()
+        self.u_last = u0.copy()
 
-        # === Quadratic program: 0.5 F^T P F + q^T F
-        P = (Sx_s.T @ Q_big @ Sx_s) + R_big
-        P = 0.5 * (P + P.T)  # symmetrize for OSQP
-        P = P.tocsc()        # ensure CSC for OSQP
+        x_traj = np.zeros((N+1, 12))
+        for k in range(N+1):
+            xk = self.solver.get(k, "x")
+            x_traj[k] = np.array(xk).reshape(12)
 
-        # Build q as dense 1-D vector (avoid sparse/matrix types)
-        delta_x = (gx - Xref)                      # (12N,)
-        t1 = Sx_s.T.dot(Q_big.dot(delta_x))        # may be np.matrix / sparse
-        t2 = R_big.dot(Fref)                       # may be np.matrix / sparse
-
-        # Convert both to flat dense arrays
-        if hasattr(t1, "toarray"):  # sparse -> dense
-            t1 = t1.toarray()
-        t1 = np.asarray(t1, dtype=np.float64).ravel()
-
-        if hasattr(t2, "toarray"):
-            t2 = t2.toarray()
-        t2 = np.asarray(t2, dtype=np.float64).ravel()
-
-        q = (t1 - t2).astype(np.float64)           # (12N,)
-
-        # === Inequalities: friction pyramid + normal force bounds, per stage ===
-        A_rows, l_list, u_list = [], [], []
-        for k in range(N):
-            S_k = S_block[12 * k : 12 * (k + 1), 12 * k : 12 * (k + 1)]
-            A_ineq_k, l_k, u_k = self._friction_pyramid_blocks(S_k)
-            A_block = np.zeros((A_ineq_k.shape[0], 12 * N))
-            A_block[:, 12 * k : 12 * (k + 1)] = A_ineq_k
-            A_rows.append(A_block); l_list.append(l_k); u_list.append(u_k)
-
-        if A_rows:
-            A = sparse.csc_matrix(np.vstack(A_rows))
-            l = np.hstack(l_list).astype(float)
-            u = np.hstack(u_list).astype(float)
-        else:
-            A = sparse.csc_matrix((0, 12 * N)); l = np.array([], float); u = np.array([], float)
-
-        # === Solve QP ===
-        prob = self._osqp
-        prob.setup(P=P, q=q, A=A, l=l, u=u, warm_start=self._is_warm, verbose=False)
-        res = prob.solve()
-        if res.info.status_val not in (1, 2):
-            # Infeasible: return zeros (and you’ll see residual print below)
-            F = np.zeros(12 * N)
-            self._is_warm = False
-        else:
-            F = res.x
-            self._is_warm = True
-
-        # First control (12,) — return GRFs for stage 0
-        f0 = F[:12]
-
-        # --------- quick residual debug (current first) ----------
-        def _debug_residuals(p0, feet_world_4x3, f12, mass, grav=np.array([0,0,-9.81], float)):
-            p0 = np.asarray(p0, float).reshape(3,)
-            Fk = np.asarray(f12, float).reshape(4,3)
-            feet = np.asarray(feet_world_4x3, float).reshape(4,3)
-            m = float(mass)
-            g = np.asarray(grav, float).reshape(3,)
-            netF = Fk.sum(axis=0) + m*g
-            tau = np.zeros(3)
-            for i in range(4):
-                tau += np.cross(feet[i] - p0, Fk[i])
-            print("[resid] netF:", netF, " tau:", tau)
-
-        # _debug_residuals(p0, r_over_h[0,:,:], f0.reshape(4,3), self.m, self.gvec)
-
-        # --- rollout for logging/preview (p, v, theta, omega) ---
-        pred = np.zeros((N + 1, 12))
-        p = p0.copy(); v = v0.copy(); th = theta0.copy(); w = w0.copy()
-        pred[0, :] = np.hstack([p, v, th, w])
-        for k in range(N):
-            fk = F[12 * k : 12 * (k + 1)].reshape(4, 3)
-            acc = self.gvec + (1.0 / self.m) * fk.sum(axis=0)
-            tau = np.zeros(3)
-            for i in range(4):
-                tau += np.cross(r_over_h[k, i, :] - p0, fk[i])  # torque arm uses p0 (frozen)
-            alpha = I_world0_inv @ tau
-            p = p + dt * v
-            v = v + dt * acc
-            th = th + dt * w
-            w = w + dt * alpha
-            pred[k + 1, :] = np.hstack([p, v, th, w])
-
-        footholds = [r_over_h[0, i, :] for i in range(4)]
-        return f0, footholds, pred
-
+        return u0, feet0, {"x_traj": x_traj}
+    
     def reset(self):
         """
-        Reset the QP solver state (NMPC parity).
-        Clears warm start and reinitializes the OSQP workspace.
+        Clear warm starts and internal anchors between episodes.
+        Safe to call before the first compute_control() of a new rollout.
         """
-        self._osqp = osqp.OSQP()
-        self._is_warm = False
+        # reset internal anchors for references & delta-u penalty
+        self.u_last = None
+        self._cmd_prev = {"vx": 0.0, "vy": 0.0, "yr": 0.0}
+
+        # optional: clear acados warm-starts (ignore if solver not yet fully built)
+        try:
+            nx, nu, N = 12, 12, self.N
+            zero_x = np.zeros(nx, dtype=float)
+            zero_u = np.zeros(nu, dtype=float)
+            for k in range(N):
+                self.solver.set(k, "u", zero_u)
+            for k in range(N + 1):
+                self.solver.set(k, "x", zero_x)
+        except Exception:
+            pass

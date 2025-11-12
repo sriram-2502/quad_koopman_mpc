@@ -261,7 +261,7 @@ class SRBDControllerInterface:
                 # MIT convex MPC with acados
                 nmpc_GRFs, nmpc_footholds, nmpc_predicted_state = \
                     self.controller.compute_control(
-                        state_current, ref_state, contact_sequence, inertia=inertia, 
+                        state_current, ref_state, contact_sequence, 
                     )
                 nmpc_joints_pos = None
                 nmpc_joints_vel = None

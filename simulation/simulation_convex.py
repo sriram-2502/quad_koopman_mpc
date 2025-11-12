@@ -38,9 +38,9 @@ if __name__ == "__main__":
     out_h5 = run_simulation(
         qpympc_cfg=cfg,
         num_episodes=1,
-        num_seconds_per_episode=10,
+        num_seconds_per_episode=5,
         ref_base_lin_vel=1.0,
-        ref_base_ang_vel=(0.0, 0.0),
+        ref_base_ang_vel=(-0.5, 0.5),
         friction_coeff=1.0,
         base_vel_command_type="forward",
         seed=0,
