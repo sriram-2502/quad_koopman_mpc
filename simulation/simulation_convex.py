@@ -18,6 +18,9 @@ if str(REPO_ROOT) not in sys.path:
 from quadruped_pympc import config as cfg
 
 cfg.mpc_params["type"] = "mit_convex"
+# cfg.mpc_params["horizon"] = 10
+# cfg.mpc_params["dt"] = 0.01
+
 # Sim timing
 cfg.simulation_params["dt"] = 0.002
 cfg.simulation_params["mpc_frequency"] = 100    # run MPC every 10 ms
@@ -40,9 +43,9 @@ if __name__ == "__main__":
         num_episodes=1,
         num_seconds_per_episode=5,
         ref_base_lin_vel=1.0,
-        ref_base_ang_vel=(-0.5, 0.5),
+        ref_base_ang_vel=0.0,
         friction_coeff=1.0,
-        base_vel_command_type="forward",
+        base_vel_command_type="forward+rotate",
         seed=0,
         render=True,
         recording_path=str(logdir),

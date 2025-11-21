@@ -58,7 +58,7 @@ class MITConvexCentroidalMPC:
             Rf = np.kron(np.eye(4), np.diag([1e-6, 1e-6, 5e-4]))
         if Rdu is None:
             # slightly stronger Δu penalty on fz (stabilize contact transitions)
-            Rdu = np.kron(np.eye(4), np.diag([2e-7, 2e-7, 5e-4]))
+            Rdu = np.kron(np.eye(4), np.diag([2e-9, 2e-9, 5e-9]))
         self.Rf, self.Rdu = Rf, Rdu
 
         self.u_last = None  # Δu anchor
@@ -121,7 +121,7 @@ class MITConvexCentroidalMPC:
 
         # register model
         model = AcadosModel()
-        model.name = "centroidal_mpc_qp_mit_yawA"
+        model.name = "mit_convex_mpc"
         model.x = x
         model.u = u
         # params: pbar(3) + rFL(3)+rFR(3)+rRL(3)+rRR(3) + vec(Iinv)(9) + psi(1) = 25
