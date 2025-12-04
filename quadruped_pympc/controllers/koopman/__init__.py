@@ -1,6 +1,3 @@
-# quadruped_pympc/controllers/koopman/__init__.py
+from .koopman_mpc import KoopmanConvexMPC
 
-from .koopman_controller import KoopmanController
-from .koopman_mpc import Koopman_MPC
-
-__all__ = ["KoopmanController", "Koopman_MPC"]
+__all__ = ["KoopmanConvexMPC"]

@@ -21,7 +21,7 @@ cfg.mpc_params["type"] = "koopman"
 cfg.mpc_params["horizon"] = 10
 # Sim timing
 cfg.simulation_params["dt"] = 0.002
-cfg.simulation_params["mpc_frequency"] = 200    # run MPC every 10 ms
+cfg.simulation_params["mpc_frequency"] = 100    # run MPC every 10 ms
 
 # ---------- Import default run_simulation by path ----------
 _spec = importlib.util.spec_from_file_location("default_runner", str(DEFAULT_RUNNER))
@@ -39,9 +39,9 @@ if __name__ == "__main__":
     out_h5 = run_simulation(
         qpympc_cfg=cfg,
         num_episodes=1,
-        num_seconds_per_episode=0.5,
+        num_seconds_per_episode=1.0,
         ref_base_lin_vel=0.5,
-        ref_base_ang_vel=(-0.1, 0.1),
+        ref_base_ang_vel=(-0.2, 0.2),
         friction_coeff=1.0,
         base_vel_command_type="forward+rotate",
         seed=0,

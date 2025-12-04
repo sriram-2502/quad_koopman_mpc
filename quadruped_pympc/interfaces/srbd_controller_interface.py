@@ -4,8 +4,8 @@ import numpy as np
 from gym_quadruped.utils.quadruped_utils import LegsAttr
 
 from quadruped_pympc import config as cfg
-from quadruped_pympc.controllers.koopman import KoopmanController
-# ADD:
+from quadruped_pympc.controllers.koopman import KoopmanConvexMPC
+
 from quadruped_pympc.controllers.convex.mit_convex_mpc import MITConvexCentroidalMPC
 
 def _get_from_cfg():
@@ -103,8 +103,18 @@ class SRBDControllerInterface:
             self.controller = Sampling_MPC()
 
         elif self.type == "koopman":
-            # Learned linear Koopman controller (GRF optimization)
-            self.controller = KoopmanController(cfg)
+            mass, inertia_cfg, g, mu, fz_min, fz_max = _get_from_cfg()
+            self.controller = KoopmanConvexMPC(
+                mass=mass,
+                inertia=inertia_cfg,
+                N=self.horizon,
+                dt=self.mpc_dt,
+                g=g,
+                mu=mu,
+                fz_min=fz_min,
+                fz_max=fz_max,
+                model_path=None,
+            )
 
         elif self.type == "mit_convex":
             mass, inertia_cfg, g, mu, fz_min, fz_max = _get_from_cfg()
