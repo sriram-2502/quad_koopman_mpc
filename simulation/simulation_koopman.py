@@ -18,7 +18,7 @@ if str(REPO_ROOT) not in sys.path:
 from quadruped_pympc import config as cfg
 
 cfg.mpc_params["type"] = "koopman"
-cfg.mpc_params["horizon"] = 10
+cfg.mpc_params["horizon"] = 5
 # Sim timing
 cfg.simulation_params["dt"] = 0.002
 cfg.simulation_params["mpc_frequency"] = 100    # run MPC every 10 ms
@@ -39,7 +39,7 @@ if __name__ == "__main__":
     out_h5 = run_simulation(
         qpympc_cfg=cfg,
         num_episodes=1,
-        num_seconds_per_episode=1.0,
+        num_seconds_per_episode=3.0,
         ref_base_lin_vel=0.5,
         ref_base_ang_vel=(-0.2, 0.2),
         friction_coeff=1.0,
