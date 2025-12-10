@@ -21,7 +21,7 @@ cfg.mpc_params["type"] = "koopman"
 cfg.mpc_params["horizon"] = 5
 # Sim timing
 cfg.simulation_params["dt"] = 0.002
-cfg.simulation_params["mpc_frequency"] = 100    # run MPC every 10 ms
+cfg.simulation_params["mpc_frequency"] = 50    # run MPC every 10 ms
 
 # ---------- Import default run_simulation by path ----------
 _spec = importlib.util.spec_from_file_location("default_runner", str(DEFAULT_RUNNER))
