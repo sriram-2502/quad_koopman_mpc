@@ -71,7 +71,7 @@ class KoopmanConvexMPC:
         dt: float,
         g: float = 9.81,
         mu: float = 1.0,
-        fz_min: float = 100.0,
+        fz_min: float = 10.0,
         fz_max: float = 1e3,
         Qp: Sequence[float] | float = (1e2, 1e2, 1e2),
         Qv: Sequence[float] | float = (1e2, 1e2, 1e2),
@@ -95,10 +95,14 @@ class KoopmanConvexMPC:
         slack_wrench_torque: float = 1e6,
         model_path: Path | str = None,
         lift_fn=None,
+        debug: bool = True,
+        use_constraints: bool = True,
+        use_simple_dynamics: bool = True,
     ):  
-        # Debug toggle: if False, skip friction/box/wrench constraints
-        self._use_constraints = True
-        self.debug = True
+        # Toggle all inequality/box/wrench consistency constraints; keep only dynamics if False
+        self._use_constraints = bool(use_constraints)
+        self.debug = bool(debug)
+        self.use_simple_dynamics = bool(use_simple_dynamics)
         
         # load the EDMD model (A,B,meta) based on wrench inputs
         self._load_model(model_path)
@@ -236,9 +240,13 @@ class KoopmanConvexMPC:
         u = MX.sym("u", nu)  # [GRF(12), wrench(6)]
         arms = MX.sym("arms", 12)  # lever arms per stage (flattened)
 
-        # Dynamics: z+ = A z + B_bar u
-        A_mx = MX(self.A)
-        B_mx = MX(self.B_bar)
+        # Dynamics: either Koopman lifted model or simple integrator for debugging
+        if self.use_simple_dynamics:
+            A_mx = MX.eye(nx)
+            B_mx = MX.ones(nx, nu)
+        else:
+            A_mx = MX(self.A)
+            B_mx = MX(self.B_bar)
         x_next = A_mx @ x + B_mx @ u
 
        # 1. Corrected Reshape: CasADi is column-major. 
@@ -273,8 +281,9 @@ class KoopmanConvexMPC:
         h_expr = vertcat(force_expr, torque_expr)
 
         # Name the model with expected slack count to avoid reusing stale codegen
+        n_sh = 6 if self._use_constraints else 0
         model = AcadosModel()
-        model.name = "koopman_mpc_fixed_v2"
+        model.name = f"koopman_mpc_fixed_v2_simple{int(self.use_simple_dynamics)}_nsh{n_sh}"
         model.x = x
         model.u = u
         model.p = arms
