@@ -1,3 +1,4 @@
+from pathlib import Path
 import numpy as np
 from scipy import sparse
 from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
@@ -58,7 +59,7 @@ class MITConvexCentroidalMPC:
             Rf = np.kron(np.eye(4), np.diag([1e-6, 1e-6, 5e-4]))
         if Rdu is None:
             # slightly stronger Δu penalty on fz (stabilize contact transitions)
-            Rdu = np.kron(np.eye(4), np.diag([2e-9, 2e-9, 5e-9]))
+            Rdu = np.kron(np.eye(4), np.diag([0, 0, 0]))
         self.Rf, self.Rdu = Rf, Rdu
 
         self.u_last = None  # Δu anchor
@@ -199,8 +200,12 @@ class MITConvexCentroidalMPC:
         ocp.solver_options.integrator_type = "DISCRETE"
         ocp.solver_options.nlp_solver_type = "SQP_RTI"
 
+        # Export code to a stable, controller-local directory (matches nominal MPC setup)
+        code_export_dir = Path(__file__).parent / "c_generated_code"
+        ocp.code_export_directory = str(code_export_dir)
+
         self.ocp = ocp
-        self.solver = AcadosOcpSolver(ocp, json_file="centroidal_qp_mit_yawA.json")
+        self.solver = AcadosOcpSolver(ocp, json_file=str(code_export_dir / "centroidal_qp_mit_yawA.json"))
 
     # ---------- utilities ----------
     def _as_mat(self, val, n):

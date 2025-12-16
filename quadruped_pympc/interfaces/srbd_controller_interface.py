@@ -114,6 +114,7 @@ class SRBDControllerInterface:
                 fz_min=fz_min,
                 fz_max=fz_max,
                 model_path=None,
+                lift_fn=None,
             )
 
         elif self.type == "mit_convex":
