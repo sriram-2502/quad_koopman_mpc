@@ -1,7 +1,7 @@
 """
 Koopman convex MPC (acados) using lifted linear dynamics learned via EDMD.
 
-Dynamics: z_{k+1} = A z_k + B̄ ū_k,  ū = [GRF(12); wrench(6)],  B̄ = [0 B].
+Dynamics: z_{k+1} = A z_k + Bbar ubar_k,  ubar = [GRF(12); wrench(6)],  Bbar = [0 B].
 Only the wrench drives the lifted dynamics; GRFs are constrained to match the wrench
 through net force/torque equalities and friction/normal bounds.
 """
@@ -94,9 +94,11 @@ class KoopmanConvexMPC:
         slack_wrench_torque: float = 0.0,
         model_path: Path | str = None,
         lift_fn=None,
+        debug: bool = True,
     ):  
         # Debug toggle: if False, skip friction/box/wrench constraints
-        self._use_constraints = False
+        self._use_constraints = True
+        self.debug = bool(debug)
         
         # load the EDMD model (A,B,meta) based on wrench inputs
         self._load_model(model_path)
@@ -117,6 +119,8 @@ class KoopmanConvexMPC:
         self.nu_f = 12
         self.nu = self.nu_f + self.nu_w
         self.B_bar = np.hstack([np.zeros((self.nphi, self.nu_f)), self.B])
+        # Keep last command for slew limiting inside compute_control
+        self._cmd_prev = {"vx": 0.0, "vy": 0.0, "yr": 0.0}
         
         # Sanity check
         _probe_x = np.zeros(12, float)
@@ -176,8 +180,8 @@ class KoopmanConvexMPC:
         [pos(3), lin_vel(3), vec(R)(9), w(3), psi_bar(...)]. psi_bar is left unweighted.
 
         Accepted shapes:
-        - Qp, Qv, Qw: scalar or len-3 → diag on their blocks.
-        - QR: scalar → scalar*I_9; len-9 → diag on vec(R).
+        - Qp, Qv, Qw: scalar or len-3 -> diag on their blocks.
+        - QR: scalar -> scalar*I_9; len-9 -> diag on vec(R).
         """
         Qz = np.zeros((self.nphi, self.nphi))
 
@@ -380,7 +384,12 @@ class KoopmanConvexMPC:
         ocp.solver_options.nlp_solver_type = "SQP_RTI"
         ocp.solver_options.tf = self.N * self.dt
 
-        return AcadosOcpSolver(ocp, json_file=f"{model.name}.json")
+        # Export generated code locally (matches other controllers)
+        code_export_dir = Path(__file__).parent / "c_generated_code"
+        code_export_dir.mkdir(parents=True, exist_ok=True)
+        ocp.code_export_directory = str(code_export_dir)
+
+        return AcadosOcpSolver(ocp, json_file=str(code_export_dir / f"{model.name}.json"))
 
     def solve(
         self,
@@ -398,6 +407,11 @@ class KoopmanConvexMPC:
         z_ref = np.asarray(z_ref, float)
         u_ref = np.asarray(u_ref, float)
         arms_seq = np.asarray(arms_seq, float)
+
+        if self.debug:
+            print("[Koopman MPC] solve() called")
+            print(f"  z0 shape={z0.shape}, z_ref shape={z_ref.shape}, u_ref shape={u_ref.shape}")
+            print(f"  arms_seq shape={arms_seq.shape}, contact_sched shape={None if contact_schedule is None else contact_schedule.shape}")
 
         if z_ref.shape != (N + 1, nphi):
             raise ValueError(f"z_ref must be (N+1,{nphi})")
@@ -438,12 +452,29 @@ class KoopmanConvexMPC:
                         lbu_k[3 * leg + 2] = self.fz_min
                 solver.set(k, "lbu", lbu_k)
                 solver.set(k, "ubu", ubu_k)
+                if self.debug and k == 0:
+                    print(f"[Koopman MPC] stage {k} contact_sched={contact_schedule[k]} -> lbu[0:12]={lbu_k[:12]}")
             solver.set(k, "u", u_ref[k])
 
         solver.cost_set(N, "yref", z_ref[N])
         solver.set(N, "p", arms_seq[N - 1].reshape(-1))
 
         status = solver.solve()
+        if self.debug:
+            print(f"[Koopman MPC] solver status={status}")
+            try:
+                cost_val = solver.get_cost() if hasattr(solver, "get_cost") else solver.get(0, "cost_value")
+                print(f"[Koopman MPC] cost={float(cost_val)}")
+            except Exception:
+                print("[Koopman MPC] cost unavailable")
+            try:
+                stats = solver.get_stats()
+                if isinstance(stats, dict):
+                    print(f"[Koopman MPC] stats keys={list(stats.keys())}")
+                    if "time_tot" in stats:
+                        print(f"[Koopman MPC] time_tot={stats['time_tot']}")
+            except Exception:
+                pass
         if status != 0:
             cs0 = contact_schedule[0] if contact_schedule is not None else "n/a"
             print(
