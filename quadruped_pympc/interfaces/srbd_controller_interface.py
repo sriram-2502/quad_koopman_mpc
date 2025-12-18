@@ -111,6 +111,8 @@ class SRBDControllerInterface:
                 dt=self.mpc_dt,
                 g=g,
                 mu=mu,
+                fz_min=fz_min,
+                fz_max=fz_max,
                 model_path=None,
                 lift_fn=None,
             )

@@ -93,7 +93,7 @@ class KoopmanConvexMPC:
         g: float = 9.81,
         mu: float = 1.0,
         fz_min: float = 0.0,
-        fz_max: float = 1000.0,
+        fz_max: float = 200.0,
         Qp: Sequence[float] | float = (1e2, 1e2, 1e3),
         Qv: Sequence[float] | float = (1e3, 1e2, 1e2),
         QR: Sequence[float] | float | np.ndarray = (
@@ -105,7 +105,7 @@ class KoopmanConvexMPC:
         R_grf: Sequence[float] | float = np.diag([1e-2, 1e-2, 1e-2]),
         model_path: Path | str = None,
         lift_fn=None,
-        debug: bool = True,
+        debug: bool = False,
         use_constraints: bool = True,
         use_simple_dynamics: bool = False,
     ):  
