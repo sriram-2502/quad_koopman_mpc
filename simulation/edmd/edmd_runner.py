@@ -44,23 +44,10 @@ def lift_row(X: np.ndarray, p_max: int) -> np.ndarray:
     """Batch/row lift → returns 2-D Φ (for rollout), accepts (1,nx) or (N,nx)."""
     return geom_observables(np.asarray(X, float), p_max=p_max)
 
-def _vee_from_skew(omega_hat: np.ndarray) -> np.ndarray:
-    """
-    Inverse of skew (vee operator). For
-      ω̂ = [[0, -wz,  wy],
-            [wz,  0, -wx],
-            [-wy, wx, 0]]
-    we have ω = [ω̂[2,1], ω̂[0,2], ω̂[1,0]].
-    """
-    wx = omega_hat[..., 2, 1]
-    wy = omega_hat[..., 0, 2]
-    wz = omega_hat[..., 1, 0]
-    return np.stack([wx, wy, wz], axis=-1)
-
 def decode_state_from_geom_phi(Phi: np.ndarray, p_max: int, nx: int = 12) -> np.ndarray:
     """
     Decode x = [pos(3), eul_xyz(rad)(3), v(3), ω(3)] from Φ built by your basis:
-      Φ = [ pos(3), lin_vel(3), vec(R)(9), vec(ω̂)(9), vec(R ω̂^p)_{p=1..p_max} ]
+      Φ = [ pos(3), lin_vel(3), vec(R)(9), ω(3), vec(R ω^p)_{p=1..p_max} ]
     Works on (N, Nφ) or (1, Nφ).
     """
     Phi = np.asarray(Phi, float)
@@ -72,7 +59,7 @@ def decode_state_from_geom_phi(Phi: np.ndarray, p_max: int, nx: int = 12) -> np.
     pos = Phi[:, i:i+3];           i += 3
     vlin = Phi[:, i:i+3];          i += 3
     Rvec = Phi[:, i:i+9];          i += 9
-    ohvec = Phi[:, i:i+9];         i += 9
+    omg = Phi[:, i:i+3];           i += 3
     # remainder (9*p_max) are ψ̄ terms we don't need for decoding
 
     Rmat = Rvec.reshape(N, 3, 3)
@@ -81,14 +68,11 @@ def decode_state_from_geom_phi(Phi: np.ndarray, p_max: int, nx: int = 12) -> np.
     # Rmat = U @ Vt
 
     eul = R.from_matrix(Rmat).as_euler("xyz", degrees=False)  # (N,3)
-    omega_hat = ohvec.reshape(N, 3, 3)
-    omega = _vee_from_skew(omega_hat)                         # (N,3)
-
     x = np.zeros((N, nx), dtype=float)
     x[:, 0:3] = pos
     x[:, 3:6] = eul
     x[:, 6:9] = vlin
-    x[:, 9:12] = omega
+    x[:, 9:12] = omg
     return x
 
 # =========================================================

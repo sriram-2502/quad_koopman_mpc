@@ -7,19 +7,15 @@ from typing import Dict, Optional, Tuple
 # ---- helpers consistent with your basis.observables layout ----
 def obs_slices(p_max: int) -> Tuple[slice, slice, slice, slice]:
     """
-    Your observables = [pos(3), lin_vel(3), R(9), omega_hat(9), psi_bar(...)]
+    Your observables = [pos(3), lin_vel(3), R(9), omega(3), psi_bar(...)]
     Return slices to extract those first 4 blocks from a lifted vector.
     """
     i = 0
     sl_pos = slice(i, i+3); i += 3
     sl_lin = slice(i, i+3); i += 3
     sl_R   = slice(i, i+9); i += 9
-    sl_oh  = slice(i, i+9); i += 9
+    sl_oh  = slice(i, i+3); i += 3
     return sl_pos, sl_lin, sl_R, sl_oh
-
-def vee(S: np.ndarray) -> np.ndarray:
-    """Inverse of hat: so(3)->R^3. Expects a 3x3 skew-symmetric."""
-    return np.array([S[2,1], S[0,2], S[1,0]], dtype=float)
 
 def nearest_SO3(M: np.ndarray) -> np.ndarray:
     """Project a 3x3 matrix to the closest rotation (det=+1) via SVD."""
@@ -43,9 +39,7 @@ def z_to_state12(z: np.ndarray, sl_pos, sl_lin, sl_R, sl_oh, degrees: bool=False
     lin_v = z[sl_lin]
     Rm = nearest_SO3(z[sl_R].reshape(3,3))
     eul = R.from_matrix(Rm).as_euler('xyz', degrees=degrees)
-    S = z[sl_oh].reshape(3,3)
-    S = 0.5*(S - S.T)  # enforce skew
-    omg = vee(S)
+    omg = z[sl_oh]
     return np.concatenate([pos, eul, lin_v, omg], axis=0)
 
 def n_step_predict_open_loop(A: np.ndarray,

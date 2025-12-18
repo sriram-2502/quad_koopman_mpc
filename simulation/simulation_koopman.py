@@ -42,7 +42,7 @@ if __name__ == "__main__":
         num_seconds_per_episode=3.0,
         ref_base_lin_vel=0.5,
         ref_base_ang_vel=(-0.2, 0.2),
-        friction_coeff=1.0,
+        friction_coeff=0.5,
         base_vel_command_type="forward+rotate",
         seed=0,
         render=True,

@@ -20,9 +20,9 @@ def observables(x, p_max=2):
     N = x.shape[0]
     # Rotation matrices: (N, 3, 3)
     Rmat = R.from_euler('xyz', eul).as_matrix()
+    # psi_bar: [vec(R @ omega_hat^p) for p in 1..p_max]
     # Omega hat: (N, 3, 3)
     omega_hat = skew_symmetric(omega)
-    # psi_bar: [vec(R @ omega_hat^p) for p in 1..p_max]
     psi_bar = []
     omega_hat_p = omega_hat.copy()
     for p in range(1, p_max + 1):
@@ -34,4 +34,4 @@ def observables(x, p_max=2):
     Rmat_vec = Rmat.reshape(N, -1)
     omega_hat_vec = omega_hat.reshape(N, -1)
     # Concatenate all observables
-    return np.concatenate([pos, lin_vel, Rmat_vec, omega_hat_vec, psi_bar], axis=-1)
+    return np.concatenate([pos, lin_vel, Rmat_vec, omega, psi_bar], axis=-1)

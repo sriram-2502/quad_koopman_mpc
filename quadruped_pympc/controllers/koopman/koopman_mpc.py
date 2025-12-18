@@ -12,6 +12,7 @@ from typing import Optional, Sequence, Dict, Any
 import numpy as np
 from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
 from casadi import MX, vertcat, horzcat, reshape
+from scipy.spatial.transform import Rotation as R
 
 # import lifting function from correct path
 def _load_lift_1d():
@@ -34,6 +35,29 @@ def _load_lift_1d():
         _edmd_mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(_edmd_mod)  # type: ignore
         return getattr(_edmd_mod, "lift_1d", None)
+    except Exception:
+        return None
+
+def _load_decode_geom():
+    """
+    Try to import simulation.edmd.edmd_runner.decode_state_from_geom_phi via sys.path or explicit path.
+    Returns None if not found.
+    """
+    try:
+        from simulation.edmd.edmd_runner import decode_state_from_geom_phi  # type: ignore
+        return decode_state_from_geom_phi
+    except Exception:
+        pass
+    try:
+        import importlib.util, sys
+        _edmd_file = Path(__file__).resolve().parents[3] / "simulation" / "edmd" / "edmd_runner.py"
+        _edmd_dir = _edmd_file.parent
+        if str(_edmd_dir) not in sys.path:
+            sys.path.insert(0, str(_edmd_dir))
+        spec = importlib.util.spec_from_file_location("edmd_runner", str(_edmd_file))
+        _edmd_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_edmd_mod)  # type: ignore
+        return getattr(_edmd_mod, "decode_state_from_geom_phi", None)
     except Exception:
         return None
 
@@ -71,8 +95,8 @@ class KoopmanConvexMPC:
         dt: float,
         g: float = 9.81,
         mu: float = 1.0,
-        fz_min: float = 10.0,
-        fz_max: float = 1e3,
+        fz_min: float = 0.0,
+        fz_max: float = 1000.0,
         Qp: Sequence[float] | float = (1e2, 1e2, 1e2),
         Qv: Sequence[float] | float = (1e2, 1e2, 1e2),
         QR: Sequence[float] | float | np.ndarray = (
@@ -83,12 +107,12 @@ class KoopmanConvexMPC:
         Qw: Sequence[float] | float = (1e2, 1e2, 1e2),
         R_grf: Sequence[float] | float = np.diag([1e-6, 1e-6, 5e-4]),
         R_wrench: Sequence[float] | float = (
-            1e2,
-            1e2,
-            1e2,
-            1e2,
-            1e2,
-            1e2,
+            0.0,
+            0.0,
+            0.0,
+            100.0,
+            100.0,
+            100.0,
         ),
         # slack penalties (quadratic weights) for wrench consistency constraints
         slack_wrench_force: float = 1e6,
@@ -109,6 +133,7 @@ class KoopmanConvexMPC:
         
         # load basis functions
         self._init_lift(lift_fn)
+        self._decode_fn = _load_decode_geom()
 
         # setup params
         self.mass = float(mass)
@@ -119,10 +144,14 @@ class KoopmanConvexMPC:
         self.fz_min = float(fz_min)
         self.fz_max = float(fz_max)
         self.nphi = self.A.shape[0]
-        self.nu_w = self.B.shape[1]
+        self.nu_w = 6
         self.nu_f = 12
         self.nu = self.nu_f + self.nu_w
-        self.B_bar = np.hstack([np.zeros((self.nphi, self.nu_f)), self.B])
+        # Row-form input map: u_full @ Bbar_row.T = phi contribution; zero GRF block, wrench block = B (column)
+        self.B_bar_row = np.zeros((self.nu, self.nphi))
+        # Wrench inputs live in the last 6 slots of u; attach EDMD B there
+        self.B_bar_row[self.nu_f :, :] = self.B.T
+        self.B_bar = self.B_bar_row.T  # column-form convenience
         # Keep last command for slew limiting inside compute_control
         self._cmd_prev = {"vx": 0.0, "vy": 0.0, "yr": 0.0}
         
@@ -220,6 +249,32 @@ class KoopmanConvexMPC:
 
         return Qz
 
+    def _decode_z_to_x(self, Z: np.ndarray) -> np.ndarray:
+        """
+        Decode lifted states Z to base states x (12D).
+        Falls back to the first 12 components if no decoder/p_max is available.
+        """
+        Z = np.asarray(Z, float)
+        if Z.ndim == 1:
+            Z = Z.reshape(1, -1)
+        p_max = None
+        if isinstance(self.meta, dict):
+            p_max = self.meta.get("p_max", None)
+        if Z.shape[1] < 18:
+            raise ValueError(f"Cannot decode lifted state with dim {Z.shape[1]} to 12D base state.")
+        pos = Z[:, 0:3]
+        vlin = Z[:, 3:6]
+        Rvec = Z[:, 6:15]
+        omega = Z[:, 15:18]
+        Rmat = Rvec.reshape(Z.shape[0], 3, 3)
+        eul = R.from_matrix(Rmat).as_euler("xyz", degrees=False)
+        x = np.zeros((Z.shape[0], 12), float)
+        x[:, 0:3] = pos
+        x[:, 3:6] = eul
+        x[:, 6:9] = vlin
+        x[:, 9:12] = omega
+        return x
+
     def _load_model(self, model_path: Path | str | None):
         if model_path is None:
             # Default to koopman/models/wrench_model.npz
@@ -232,22 +287,23 @@ class KoopmanConvexMPC:
         self.meta = data["meta"].item() if "meta" in data.files and np.asarray(data["meta"]).size == 1 else {}
    
     def _build_solver(self) -> AcadosOcpSolver:
-        nx = self.nphi
+        nz = self.nphi
         nu = self.nu
 
         # symbols
-        x = MX.sym("x", nx)
+        z = MX.sym("z", nz)
         u = MX.sym("u", nu)  # [GRF(12), wrench(6)]
         arms = MX.sym("arms", 12)  # lever arms per stage (flattened)
 
         # Dynamics: either Koopman lifted model or simple integrator for debugging
         if self.use_simple_dynamics:
-            A_mx = MX.eye(nx)
-            B_mx = MX.ones(nx, nu)
+            A_mx = MX.eye(nz)
+            B_mx = MX.ones(nz, nu)
         else:
-            A_mx = MX(self.A)
-            B_mx = MX(self.B_bar)
-        x_next = A_mx @ x + B_mx @ u
+            # Row rollout: phi_next = phi @ A.T + u @ B.T ⇒ column form uses A.T and B_row.T
+            A_mx = MX(self.A.T)
+            B_mx = MX(self.B_bar_row.T)
+        z_next = A_mx @ z + B_mx @ u
 
        # 1. Corrected Reshape: CasADi is column-major. 
         # u[:12] is [fx1, fy1, fz1, fx2, fy2, fz2, ...]
@@ -283,11 +339,12 @@ class KoopmanConvexMPC:
         # Name the model with expected slack count to avoid reusing stale codegen
         n_sh = 6 if self._use_constraints else 0
         model = AcadosModel()
-        model.name = f"koopman_mpc_fixed_v2_simple{int(self.use_simple_dynamics)}_nsh{n_sh}"
-        model.x = x
+        # include nonce to avoid reusing stale codegen when constraint settings change
+        model.name = f"koopman_mpc_simple"
+        model.x = z
         model.u = u
         model.p = arms
-        model.disc_dyn_expr = x_next
+        model.disc_dyn_expr = z_next
         if self._use_constraints:
             model.con_h_expr = h_expr
         else:
@@ -296,31 +353,31 @@ class KoopmanConvexMPC:
 
         ocp = AcadosOcp()
         ocp.model = model
-        ocp.dims.nx = nx
+        ocp.dims.nx = nz
         ocp.dims.nu = nu
         ocp.dims.np = 12
         ocp.dims.N = self.N
         ocp.parameter_values = np.zeros(12)
 
-        ny = nx + nu
+        ny = nz + nu
         ocp.cost.cost_type = "LINEAR_LS"
         ocp.cost.cost_type_e = "LINEAR_LS"
         W = np.zeros((ny, ny))
-        W[:nx, :nx] = self.Qz
-        W[nx:nx + self.nu_f, nx:nx + self.nu_f] = self.Rf
-        W[nx + self.nu_f :, nx + self.nu_f :] = self.Rw
+        W[:nz, :nz] = self.Qz
+        W[nz:nz + self.nu_f, nz:nz + self.nu_f] = self.Rf
+        W[nz + self.nu_f :, nz + self.nu_f :] = self.Rw
         ocp.cost.W = W
         ocp.cost.W_e = self.Qz
 
-        Vx = np.zeros((ny, nx))
+        Vx = np.zeros((ny, nz))
         Vu = np.zeros((ny, nu))
-        Vx[:nx, :nx] = np.eye(nx)
-        Vu[nx:, :] = np.eye(nu)
+        Vx[:nz, :nz] = np.eye(nz)
+        Vu[nz:, :] = np.eye(nu)
         ocp.cost.Vx = Vx
         ocp.cost.Vu = Vu
-        ocp.cost.Vx_e = np.eye(nx)
+        ocp.cost.Vx_e = np.eye(nz)
         ocp.cost.yref = np.zeros(ny)
-        ocp.cost.yref_e = np.zeros(nx)
+        ocp.cost.yref_e = np.zeros(nz)
 
         if self._use_constraints:
             # Friction pyramid + fz_max
@@ -340,7 +397,7 @@ class KoopmanConvexMPC:
                 ug.extend([0.0, 0.0, 0.0, 0.0, self.fz_max])
             A_ineq = np.vstack(A_ineq)
             ocp.dims.ng = A_ineq.shape[0]
-            ocp.constraints.C = np.zeros((ocp.dims.ng, nx))
+            ocp.constraints.C = np.zeros((ocp.dims.ng, nz))
             ocp.constraints.D = A_ineq
             ocp.constraints.lg = np.asarray(lg, float)
             ocp.constraints.ug = np.asarray(ug, float)
@@ -364,7 +421,7 @@ class KoopmanConvexMPC:
         else:
             # No inequality/box constraints for debugging
             ocp.dims.ng = 0
-            ocp.constraints.C = np.zeros((0, nx))
+            ocp.constraints.C = np.zeros((0, nz))
             ocp.constraints.D = np.zeros((0, nu))
             ocp.constraints.lg = np.zeros(0)
             ocp.constraints.ug = np.zeros(0)
@@ -384,10 +441,10 @@ class KoopmanConvexMPC:
             ocp.constraints.lbu = np.zeros(0)
             ocp.constraints.ubu = np.zeros(0)
 
-        ocp.dims.nbx_0 = nx
-        ocp.constraints.idxbx_0 = np.arange(nx, dtype=np.int32)
-        ocp.constraints.lbx_0 = np.zeros(nx)
-        ocp.constraints.ubx_0 = np.zeros(nx)
+        ocp.dims.nbx_0 = nz
+        ocp.constraints.idxbx_0 = np.arange(nz, dtype=np.int32)
+        ocp.constraints.lbx_0 = np.zeros(nz)
+        ocp.constraints.ubx_0 = np.zeros(nz)
 
         ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
         ocp.solver_options.integrator_type = "DISCRETE"
@@ -415,7 +472,7 @@ class KoopmanConvexMPC:
         contact_schedule: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
         N = self.N
-        nphi = self.nphi
+        nz = self.nphi
         nu = self.nu
 
         z0 = np.asarray(z0, float).reshape(-1)
@@ -434,8 +491,8 @@ class KoopmanConvexMPC:
             except Exception:
                 print("  could not read ocp slack dims/idx")
 
-        if z_ref.shape != (N + 1, nphi):
-            raise ValueError(f"z_ref must be (N+1,{nphi})")
+        if z_ref.shape != (N + 1, nz):
+            raise ValueError(f"z_ref must be (N+1,{nz})")
         if u_ref.shape != (N, nu):
             raise ValueError(f"u_ref must be (N,{nu})")
         if arms_seq.shape != (N, 4, 3):
@@ -482,7 +539,10 @@ class KoopmanConvexMPC:
 
         status = solver.solve()
         if self.debug:
-            print(f"[Koopman MPC] solver status={status}")
+            if status == 0:
+                print("[Koopman MPC] solver converged (status=0)")
+            else:
+                print(f"[Koopman MPC] solver failed (status={status}); outputs may be invalid")
             try:
                 cost_val = solver.get_cost() if hasattr(solver, "get_cost") else solver.get(0, "cost_value")
                 print(f"[Koopman MPC] cost={float(cost_val):.3g}")
@@ -506,6 +566,24 @@ class KoopmanConvexMPC:
                 print(f"[Koopman MPC] control k=0 net_tau={fmt(net_tau0)}")
             except Exception:
                 print("[Koopman MPC] could not retrieve control at k=0")
+            # Dynamics residual check at k=0: x1 - (A x0 + B_bar u0)
+            try:
+                x0 = np.asarray(solver.get(0, "x"), float).reshape(-1)
+                x1 = np.asarray(solver.get(1, "x"), float).reshape(-1)
+                u0 = np.asarray(solver.get(0, "u"), float).reshape(-1)
+                pred = (self.A.T @ x0) + (self.B_bar_row.T @ u0)
+                resid = x1 - pred
+                if resid.size >= 18:
+                    r_pos = resid[0:3]
+                    r_v = resid[3:6]
+                    r_R = resid[6:15]
+                    r_w = resid[15:18]
+                    r_psi = resid[18:] if resid.size > 18 else np.zeros(0)
+                    print(f"  resid pos={fmt(r_pos)} v={fmt(r_v)} Rvec={fmt(r_R)} w={fmt(r_w)}")
+                    if r_psi.size > 0:
+                        print(f"  resid psi_bar (rest)={fmt(r_psi)}")
+            except Exception:
+                print("[Koopman MPC] could not compute dynamics residual at k=0")
             # Soft-constraint slacks at current time step (k=0)
             try:
                 sl0 = np.asarray(solver.get(0, "sl"), float).reshape(-1)
@@ -563,7 +641,7 @@ class KoopmanConvexMPC:
             n_stance = int(contacts4xN[:, k].sum())
             if n_stance <= 0:
                 continue
-            fz = self.m * self.g / n_stance
+            fz = self.mass * abs(self.gvec[2]) / n_stance
             for i in range(4):
                 if contacts4xN[i, k] == 1:
                     u_ref[k, 3*i:3*i+3] = [0.0, 0.0, fz]
@@ -682,10 +760,10 @@ class KoopmanConvexMPC:
         # Fill wrench ref to sum GRFs (force + torque)
         for k in range(N):
             f_mat = u_ref[k, :12].reshape(4, 3)
-            u_ref[k, 12:15] = f_mat.sum(axis=0)
+            u_ref[k, 12:15] = 0.0*f_mat.sum(axis=0)
             arms_k = arms_seq[min(k, arms_seq.shape[0] - 1)]
             torque_k = np.sum(np.cross(arms_k, f_mat), axis=0)
-            u_ref[k, 15:18] = torque_k
+            u_ref[k, 15:18] = 0.0*torque_k
 
         # Lift references
         z_ref = np.zeros((N + 1, nphi))
@@ -710,19 +788,23 @@ class KoopmanConvexMPC:
         # Initial lift
         z0 = self.lift_fn(np.concatenate([p0, theta0, v0, w0], axis=0))
         z0 = np.asarray(z0, float).reshape(-1)
-        if z0.size != nphi:
-            if z0.size == 12 and nphi > 12:
-                tmp = np.zeros(nphi, float)
-                tmp[:12] = z0
-                z0 = tmp
-            else:
-                raise ValueError(f"lifted dim mismatch: got {z0.size}, expected {nphi}")
 
         res = self.solve(z0, z_ref, u_ref, arms_seq, contact_schedule=contacts)
+        status = res.get("status", None)
+        if status is None or status != 0:
+            if self.debug:
+                print(f"[Koopman MPC] solver failed with status {status}, returning zeros")
+            return np.zeros(12), feet0, np.zeros((N + 1, 12)), status
+
         u_pred = res["U"]
         grf0 = u_pred[0, :12] if u_pred.shape[0] > 0 else np.zeros(12)
+        z_pred = res.get("Z", None)
+        x_pred = self._decode_z_to_x(z_pred) if z_pred is not None else np.zeros((N + 1, 12))
 
-        return grf0, feet0, res.get("Z", None), res.get("status", None)
+        if self.debug:
+            print(f"[Koopman MPC] return grf0={grf0}")
+
+        return grf0, feet0, x_pred, status
     
     def reset(self):
         """
