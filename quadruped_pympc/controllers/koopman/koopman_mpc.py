@@ -1,9 +1,8 @@
 """
 Koopman convex MPC (acados) using lifted linear dynamics learned via EDMD.
 
-Dynamics: z_{k+1} = A z_k + Bbar ubar_k,  ubar = [GRF(12); wrench(6)],  Bbar = [0 B].
-Only the wrench drives the lifted dynamics; GRFs are constrained to match the wrench
-through net force/torque equalities and friction/normal bounds.
+Dynamics: z_{k+1} = A z_k + B_wrench * (H(arms) * u_grf),
+where u_grf ∈ R^12 are per-leg GRFs, and H maps GRFs to net wrench about the COM.
 """
 from __future__ import annotations
 from pathlib import Path
@@ -11,7 +10,7 @@ from typing import Optional, Sequence, Dict, Any
 
 import numpy as np
 from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
-from casadi import MX, vertcat, horzcat, reshape
+from casadi import MX, vertcat, horzcat
 from scipy.spatial.transform import Rotation as R
 
 # import lifting function from correct path
@@ -81,8 +80,6 @@ class KoopmanConvexMPC:
         Weights on first 12 physical states; zeros for remaining lifted dims.
     R_grf : float or matrix (12x12)
         GRF weight.
-    R_wrench : float or matrix (6x6)
-        Wrench weight.
     lift_fn : callable | None
         Function x->phi(x); defaults to edmd_runner.lift_1d if available else identity.
     """
@@ -97,33 +94,22 @@ class KoopmanConvexMPC:
         mu: float = 1.0,
         fz_min: float = 0.0,
         fz_max: float = 1000.0,
-        Qp: Sequence[float] | float = (1e2, 1e2, 1e2),
-        Qv: Sequence[float] | float = (1e2, 1e2, 1e2),
+        Qp: Sequence[float] | float = (1e2, 1e2, 1e3),
+        Qv: Sequence[float] | float = (1e3, 1e2, 1e2),
         QR: Sequence[float] | float | np.ndarray = (
-            1e2, 0.0, 0.0,
-            0.0, 1e2, 0.0,
+            1e2, 1e2, 0.0,
+            1e2, 1e2, 0.0,
             0.0, 0.0, 1e2,
         ),
         Qw: Sequence[float] | float = (1e2, 1e2, 1e2),
-        R_grf: Sequence[float] | float = np.diag([1e-6, 1e-6, 5e-4]),
-        R_wrench: Sequence[float] | float = (
-            0.0,
-            0.0,
-            0.0,
-            100.0,
-            100.0,
-            100.0,
-        ),
-        # slack penalties (quadratic weights) for wrench consistency constraints
-        slack_wrench_force: float = 1e6,
-        slack_wrench_torque: float = 1e6,
+        R_grf: Sequence[float] | float = np.diag([1e-2, 1e-2, 1e-2]),
         model_path: Path | str = None,
         lift_fn=None,
         debug: bool = True,
         use_constraints: bool = True,
-        use_simple_dynamics: bool = True,
+        use_simple_dynamics: bool = False,
     ):  
-        # Toggle all inequality/box/wrench consistency constraints; keep only dynamics if False
+        # Toggle inequality/box constraints; keep only dynamics if False
         self._use_constraints = bool(use_constraints)
         self.debug = bool(debug)
         self.use_simple_dynamics = bool(use_simple_dynamics)
@@ -144,14 +130,10 @@ class KoopmanConvexMPC:
         self.fz_min = float(fz_min)
         self.fz_max = float(fz_max)
         self.nphi = self.A.shape[0]
-        self.nu_w = 6
-        self.nu_f = 12
-        self.nu = self.nu_f + self.nu_w
-        # Row-form input map: u_full @ Bbar_row.T = phi contribution; zero GRF block, wrench block = B (column)
-        self.B_bar_row = np.zeros((self.nu, self.nphi))
-        # Wrench inputs live in the last 6 slots of u; attach EDMD B there
-        self.B_bar_row[self.nu_f :, :] = self.B.T
-        self.B_bar = self.B_bar_row.T  # column-form convenience
+        # GRF-only decision variables; wrench comes from H(arms) @ GRFs inside dynamics
+        self.nu = 12
+        self.nu_f = self.nu
+        self.B_wrench = np.array(self.B, float)  # (nphi, 6) wrench-driven EDMD input map
         # Keep last command for slew limiting inside compute_control
         self._cmd_prev = {"vx": 0.0, "vy": 0.0, "yr": 0.0}
         
@@ -170,11 +152,6 @@ class KoopmanConvexMPC:
         # Default anisotropic GRF weight: light fx, fy; heavier fz per leg
         R_grf = np.kron(np.eye(4), R_grf)
         self.Rf = self._as_mat(R_grf, self.nu_f)
-        self.Rw = self._as_mat(R_wrench, self.nu_w)
-        
-        # Soft-constraint penalties for wrench equality (force/torque)
-        self.slack_wrench_force = float(slack_wrench_force)
-        self.slack_wrench_torque = float(slack_wrench_torque)
         self.solver = self._build_solver()
 
     @staticmethod
@@ -292,64 +269,41 @@ class KoopmanConvexMPC:
 
         # symbols
         z = MX.sym("z", nz)
-        u = MX.sym("u", nu)  # [GRF(12), wrench(6)]
+        u = MX.sym("u", nu)  # GRFs (12)
         arms = MX.sym("arms", 12)  # lever arms per stage (flattened)
 
-        # Dynamics: either Koopman lifted model or simple integrator for debugging
+        # Build H(arms) so wrench = H @ u_f
+        def _skew_from_arm(ax, ay, az):
+            return vertcat(
+                horzcat(MX(0),    az,   -ay),
+                horzcat(   -az, MX(0),   ax),
+                horzcat(    ay,   -ax, MX(0)),
+            )
+
+        force_block = horzcat(MX.eye(3), MX.eye(3), MX.eye(3), MX.eye(3))  # (3,12)
+        mom_blocks = []
+        for i in range(4):
+            a = arms[3 * i : 3 * i + 3]
+            mom_blocks.append(_skew_from_arm(a[0], a[1], a[2]))
+        H_map = vertcat(force_block, horzcat(*mom_blocks))  # (6,12)
+        wrench = H_map @ u  # (6,)
+
+        # Dynamics: Koopman with wrench-driven B; or simple dynamics if debugging
         if self.use_simple_dynamics:
             A_mx = MX.eye(nz)
-            B_mx = MX.ones(nz, nu)
+            B_mx = MX.ones(nz, wrench.size1())
         else:
-            # Row rollout: phi_next = phi @ A.T + u @ B.T ⇒ column form uses A.T and B_row.T
-            A_mx = MX(self.A.T)
-            B_mx = MX(self.B_bar_row.T)
-        z_next = A_mx @ z + B_mx @ u
+            A_mx = MX(self.A)
+            B_mx = MX(self.B_wrench)
+        z_next = A_mx @ z + B_mx @ wrench
 
-       # 1. Corrected Reshape: CasADi is column-major. 
-        # u[:12] is [fx1, fy1, fz1, fx2, fy2, fz2, ...]
-        # We want rows to be legs, columns to be [x, y, z]
-        f_mat = reshape(u[0:12], 3, 4).T 
-        w_vec = u[12:18]
-        
-        # 2. Corrected Force Balance
-        # sum of rows (legs) for each column (x, y, z)
-        f_sum = vertcat(
-            f_mat[0,0] + f_mat[1,0] + f_mat[2,0] + f_mat[3,0],
-            f_mat[0,1] + f_mat[1,1] + f_mat[2,1] + f_mat[3,1],
-            f_mat[0,2] + f_mat[1,2] + f_mat[2,2] + f_mat[3,2]
-        )
-        force_expr = f_sum - w_vec[0:3]
-        
-        # 3. Corrected Torque Balance
-        torque_sum = MX.zeros(3)
-        for i in range(4):
-            r = arms[3*i : 3*i+3]
-            f_i = f_mat[i, :].T
-            # Cross product: r x f
-            torque_i = vertcat(
-                r[1]*f_i[2] - r[2]*f_i[1],
-                r[2]*f_i[0] - r[0]*f_i[2],
-                r[0]*f_i[1] - r[1]*f_i[0]
-            )
-            torque_sum += torque_i
-        torque_expr = torque_sum - w_vec[3:6]
-        
-        h_expr = vertcat(force_expr, torque_expr)
-
-        # Name the model with expected slack count to avoid reusing stale codegen
-        n_sh = 6 if self._use_constraints else 0
         model = AcadosModel()
         # include nonce to avoid reusing stale codegen when constraint settings change
-        model.name = f"koopman_mpc_simple"
+        model.name = f"koopman_mpc_forces"
         model.x = z
         model.u = u
         model.p = arms
         model.disc_dyn_expr = z_next
-        if self._use_constraints:
-            model.con_h_expr = h_expr
-        else:
-            # No path constraints when debugging without inequalities
-            model.con_h_expr = MX.zeros(0, 1)
 
         ocp = AcadosOcp()
         ocp.model = model
@@ -365,7 +319,6 @@ class KoopmanConvexMPC:
         W = np.zeros((ny, ny))
         W[:nz, :nz] = self.Qz
         W[nz:nz + self.nu_f, nz:nz + self.nu_f] = self.Rf
-        W[nz + self.nu_f :, nz + self.nu_f :] = self.Rw
         ocp.cost.W = W
         ocp.cost.W_e = self.Qz
 
@@ -402,17 +355,17 @@ class KoopmanConvexMPC:
             ocp.constraints.lg = np.asarray(lg, float)
             ocp.constraints.ug = np.asarray(ug, float)
 
-            ocp.dims.nh = 6
-            ocp.dims.nsh = 6
-            ocp.constraints.lh = np.zeros(6)
-            ocp.constraints.uh = np.zeros(6)
-            ocp.constraints.idxsh = np.arange(6)
-            ocp.constraints.lsh = np.zeros(6)
-            ocp.constraints.ush = np.zeros(6)
-            ocp.cost.Zl = np.diag([self.slack_wrench_force]*3 + [self.slack_wrench_torque]*3)
-            ocp.cost.Zu = ocp.cost.Zl
-            ocp.cost.zl = np.zeros(6)
-            ocp.cost.zu = np.zeros(6)
+            ocp.dims.nh = 0
+            ocp.dims.nsh = 0
+            ocp.constraints.lh = np.zeros(0)
+            ocp.constraints.uh = np.zeros(0)
+            ocp.constraints.idxsh = np.zeros(0, dtype=np.int32)
+            ocp.constraints.lsh = np.zeros(0)
+            ocp.constraints.ush = np.zeros(0)
+            ocp.cost.Zl = np.zeros((0, 0))
+            ocp.cost.Zu = np.zeros((0, 0))
+            ocp.cost.zl = np.zeros(0)
+            ocp.cost.zu = np.zeros(0)
 
             ocp.dims.nbu = nu
             ocp.constraints.idxbu = np.arange(nu, dtype=np.int32)
@@ -558,20 +511,26 @@ class KoopmanConvexMPC:
                 pass
             try:
                 u0 = np.asarray(solver.get(0, "u"), float).reshape(-1)
-                f0 = u0[:12].reshape(4, 3)
-                net_f0 = u0[12:15] if u0.size >= 15 else np.zeros(3)
-                net_tau0 = u0[15:18] if u0.size >= 18 else np.zeros(3)
+                f0 = u0.reshape(4, 3)
                 print(f"[Koopman MPC] control k=0 GRFs={fmt(f0)}")
-                print(f"[Koopman MPC] control k=0 net_f={fmt(net_f0)}")
-                print(f"[Koopman MPC] control k=0 net_tau={fmt(net_tau0)}")
             except Exception:
                 print("[Koopman MPC] could not retrieve control at k=0")
-            # Dynamics residual check at k=0: x1 - (A x0 + B_bar u0)
+            # Dynamics residual check at k=0: x1 - (A x0 + B_wrench H u0)
             try:
                 x0 = np.asarray(solver.get(0, "x"), float).reshape(-1)
                 x1 = np.asarray(solver.get(1, "x"), float).reshape(-1)
                 u0 = np.asarray(solver.get(0, "u"), float).reshape(-1)
-                pred = (self.A.T @ x0) + (self.B_bar_row.T @ u0)
+                # rebuild H for stage 0 using params
+                arms0 = np.asarray(solver.get(0, "p"), float).reshape(4, 3)
+                def _skew_np(a):
+                    return np.array([[0,    a[2], -a[1]],
+                                     [-a[2], 0,    a[0]],
+                                     [a[1], -a[0], 0   ]], float)
+                H_force = np.hstack([np.eye(3), np.eye(3), np.eye(3), np.eye(3)])
+                H_mom = np.hstack([_skew_np(a) for a in arms0])
+                H = np.vstack([H_force, H_mom])
+                wrench0 = H @ u0
+                pred = (self.A @ x0) + (self.B_wrench @ wrench0)
                 resid = x1 - pred
                 if resid.size >= 18:
                     r_pos = resid[0:3]
@@ -584,21 +543,11 @@ class KoopmanConvexMPC:
                         print(f"  resid psi_bar (rest)={fmt(r_psi)}")
             except Exception:
                 print("[Koopman MPC] could not compute dynamics residual at k=0")
-            # Soft-constraint slacks at current time step (k=0)
-            try:
-                sl0 = np.asarray(solver.get(0, "sl"), float).reshape(-1)
-                su0 = np.asarray(solver.get(0, "su"), float).reshape(-1)
-                if sl0.size > 0 or su0.size > 0:
-                    print(f"[Koopman MPC] slacks k=0 sl={fmt(sl0)} su={fmt(su0)}")
-                else:
-                    print("[Koopman MPC] slacks k=0 empty (nsh=0 or constraints disabled)")
-            except Exception:
-                print("[Koopman MPC] could not retrieve slacks at k=0")
         if status != 0:
             cs0 = contact_schedule[0] if contact_schedule is not None else "n/a"
             print(
                 f"[KoopmanConvexMPC] acados status={status} | cs0={cs0} "
-                f"| u_ref0_f={u_ref[0, :12]} | wrench_ref0={u_ref[0, 12:18]} "
+                f"| u_ref0_f={u_ref[0, :12]} "
                 f"| arms0={arms_seq[0]}"
             )
         z_pred = np.vstack([solver.get(i, "x") for i in range(N + 1)])
@@ -722,11 +671,6 @@ class KoopmanConvexMPC:
             contacts4xN = np.ones((4, N), float)
         contacts = contacts4xN.T  # keep (N,4) for downstream
 
-        # Arms (lever) defaults to zeros unless provided
-        arms_seq = np.asarray(ref_state.get("ref_arms", np.zeros((N, 4, 3))), float)
-        if arms_seq.shape != (N, 4, 3):
-            arms_seq = np.zeros((N, 4, 3))
-
         # Footholds best-effort (match convex MPC keys)
         if all(k in ref_state for k in ["ref_foot_FL", "ref_foot_FR", "ref_foot_RL", "ref_foot_RR"]):
             feet0 = np.stack([
@@ -735,18 +679,23 @@ class KoopmanConvexMPC:
                 np.asarray(ref_state["ref_foot_RL"], float).reshape(-1, 3)[0],
                 np.asarray(ref_state["ref_foot_RR"], float).reshape(-1, 3)[0],
             ], axis=0)
+            feet_over_h = self._feet_refs_over_horizon(ref_state, contacts4xN)
         else:
             feet0 = np.asarray(ref_state.get("ref_footholds", np.zeros((4, 3))), float)
             if feet0.shape != (4, 3):
                 feet0 = np.zeros((4, 3))
-        # If arms missing, derive lever arms from feet and COM refs
-        if not np.any(arms_seq):
+            feet_over_h = np.tile(feet0[None, :, :], (N, 1, 1))
+
+        # Arms (lever) from feet over horizon or provided override
+        arms_seq = np.asarray(ref_state.get("ref_arms", np.zeros((N, 4, 3))), float)
+        if arms_seq.shape != (N, 4, 3) or not np.any(arms_seq):
             com_ref = pref  # use position reference as COM proxy
+            arms_seq = np.zeros((N, 4, 3))
             for k in range(N):
                 for leg in range(4):
-                    arms_seq[k, leg, :] = feet0[leg] - com_ref[min(k, pref.shape[0]-1)]
+                    arms_seq[k, leg, :] = feet_over_h[min(k, feet_over_h.shape[0]-1), leg, :] - com_ref[min(k, pref.shape[0]-1)]
 
-        # u_ref: accept 12-D GRF-only refs (convex MPC style) or full 18-D; default to mg split
+        # u_ref: GRFs only (12), default to mg split across stance
         u_ref = np.zeros((N, nu))
         mg = self.mass * abs(self.gvec[2])
         for k in range(N):
@@ -756,14 +705,6 @@ class KoopmanConvexMPC:
                 for leg in range(4):
                     if contacts[k, leg] > 0.5:
                         u_ref[k, 3 * leg : 3 * leg + 3] = [0.0, 0.0, fz]
-
-        # Fill wrench ref to sum GRFs (force + torque)
-        for k in range(N):
-            f_mat = u_ref[k, :12].reshape(4, 3)
-            u_ref[k, 12:15] = 0.0*f_mat.sum(axis=0)
-            arms_k = arms_seq[min(k, arms_seq.shape[0] - 1)]
-            torque_k = np.sum(np.cross(arms_k, f_mat), axis=0)
-            u_ref[k, 15:18] = 0.0*torque_k
 
         # Lift references
         z_ref = np.zeros((N + 1, nphi))
