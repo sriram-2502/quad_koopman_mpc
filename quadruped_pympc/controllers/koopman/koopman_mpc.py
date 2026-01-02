@@ -12,6 +12,7 @@ import numpy as np
 from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
 from casadi import MX, vertcat, horzcat
 from scipy.spatial.transform import Rotation as R
+from quadruped_pympc import config as cfg
 
 # import lifting function from correct path
 def _load_lift_1d():
@@ -101,18 +102,22 @@ class KoopmanConvexMPC:
             1e2, 1e2, 0.0,
             0.0, 0.0, 1e2,
         ),
-        Qw: Sequence[float] | float = (1e2, 1e2, 1e2),
+        Qw: Sequence[float] | float = (1e3, 1e2, 1e2),
         R_grf: Sequence[float] | float = np.diag([1e-2, 1e-2, 1e-2]),
         model_path: Path | str = None,
         lift_fn=None,
-        debug: bool = False,
+        debug: bool = True,
         use_constraints: bool = True,
         use_simple_dynamics: bool = False,
+        slew_rate_xy: float = 0.1,
+        slew_rate_yaw: float = 0.2,
     ):  
         # Toggle inequality/box constraints; keep only dynamics if False
         self._use_constraints = bool(use_constraints)
         self.debug = bool(debug)
         self.use_simple_dynamics = bool(use_simple_dynamics)
+        self.slew_rate_xy = float(slew_rate_xy)
+        self.slew_rate_yaw = float(slew_rate_yaw)
         
         # load the EDMD model (A,B,meta) based on wrench inputs
         self._load_model(model_path)
@@ -624,30 +629,35 @@ class KoopmanConvexMPC:
         else:
             vref_in = np.array(ref_state["ref_linear_velocity"]).reshape(-1, 3)
             vx_cmd, vy_cmd = vref_in[0, 0], vref_in[0, 1]
+        raw_vx, raw_vy = vx_cmd, vy_cmd
 
         if "cmd_yawrate" in ref_state:
             yawrate_cmd = float(ref_state["cmd_yawrate"])
         else:
             wref_in = np.array(ref_state["ref_angular_velocity"]).reshape(-1, 3)
             yawrate_cmd = float(wref_in[0, 2])
+        raw_yawrate = yawrate_cmd
 
-        if "cmd_z" in ref_state:
-            z_cmd = float(ref_state["cmd_z"])
-        else:
-            if "ref_position" in ref_state:
-                pref_in = np.array(ref_state["ref_position"]).reshape(-1, 3)
-                z_cmd = float(pref_in[0, 2])
-            else:
-                z_cmd = float(p0[2])
-                
+        # Always hold vertical command at nominal hip height from config
+        z_cmd = float(cfg.hip_height)
+            
         # Optional command slew limits (operator-level accel limits)
-        a_max_xy, a_max_yaw = 1.5, 2.0
+        a_max_xy, a_max_yaw = self.slew_rate_xy, self.slew_rate_yaw
         def slew(prev, target, rate):
             step = np.clip(target - prev, -rate*dt, rate*dt)
             return prev + step
         vx_cmd = slew(self._cmd_prev["vx"], vx_cmd, a_max_xy)
         vy_cmd = slew(self._cmd_prev["vy"], vy_cmd, a_max_xy)
         yawrate_cmd = slew(self._cmd_prev["yr"], yawrate_cmd, a_max_yaw)
+        if self.debug and (
+            abs(vx_cmd - raw_vx) > 1e-6 or abs(vy_cmd - raw_vy) > 1e-6 or abs(yawrate_cmd - raw_yawrate) > 1e-6
+        ):
+            print(
+                f"[Koopman MPC] slew limited cmd: "
+                f"vx {raw_vx:.3f}->{vx_cmd:.3f}, "
+                f"vy {raw_vy:.3f}->{vy_cmd:.3f}, "
+                f"yawrate {raw_yawrate:.3f}->{yawrate_cmd:.3f}"
+            )
         self._cmd_prev = {"vx": vx_cmd, "vy": vy_cmd, "yr": yawrate_cmd}
 
         # Piecewise-constant (vx,vy,yawrate); integrate to p and yaw

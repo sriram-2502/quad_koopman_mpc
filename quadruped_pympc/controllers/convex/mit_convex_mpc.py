@@ -3,6 +3,7 @@ import numpy as np
 from scipy import sparse
 from acados_template import AcadosOcp, AcadosOcpSolver, AcadosModel
 from casadi import MX, vertcat, horzcat, reshape, cos, sin
+from quadruped_pympc import config as cfg
 
 _LEG_ORDER = ("FL", "FR", "RL", "RR")
 
@@ -322,14 +323,8 @@ class MITConvexCentroidalMPC:
             wref_in = np.array(ref_state["ref_angular_velocity"]).reshape(-1, 3)
             yawrate_cmd = float(wref_in[0, 2])
 
-        if "cmd_z" in ref_state:
-            z_cmd = float(ref_state["cmd_z"])
-        else:
-            if "ref_position" in ref_state:
-                pref_in = np.array(ref_state["ref_position"]).reshape(-1, 3)
-                z_cmd = float(pref_in[0, 2])
-            else:
-                z_cmd = float(p0[2])
+        # Always hold vertical command at nominal hip height from config
+        z_cmd = float(cfg.hip_height)
 
         # Optional command slew limits (operator-level accel limits)
         a_max_xy, a_max_yaw = 1.5, 2.0
