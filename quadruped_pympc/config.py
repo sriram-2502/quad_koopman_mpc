@@ -58,21 +58,6 @@ elif (robot == 'mini_cheetah'):
 gravity_constant = 9.81 # Exposed in case of different gravity conditions
 # ----------------------------------------------------------------------------------------------------------------
 
-#  Koopman MPC parameters
-koopman_mpc_params = {
-    'model_path': Path("simulation/edmd/saved_models_koopman/test_model.npz"),
-    'p_max': 5,
-    'horizon': 12,
-    'dt': 0.02,
-    'l2_reg': 1e-6,
-    # Cost matrices for MPC
-    'Q': np.diag([10.0, 10.0, 10.0,  # position
-                  1.0, 1.0, 1.0,      # orientation 
-                  1.0, 1.0, 1.0,      # linear velocity
-                  0.1, 0.1, 0.1]),    # angular velocity
-    'R': 0.1 * np.eye(12),           # control cost (12 = number of contact forces)
-}
-
 # ----------------------------------------------------------------------------------------------------------------
 
 mpc_params = {

@@ -8,7 +8,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="../datasets/go1/flat_terrain",
+        default="datasets/go1/flat_terrain",
         help="Directory to save the output dataset (default: datasets/go1/flat_terrain)"
     )
     parser.add_argument(
@@ -32,9 +32,12 @@ if __name__ == "__main__":
     run_simulation(
         qpympc_cfg=cfg,
         num_episodes=args.episodes,
+        ref_base_lin_vel=(0.0, 0.5),
+        ref_base_ang_vel=(-0.2, 0.2),
+        friction_coeff=(0.5,1.0),
         render=True,
         recording_path=output_dir,
-        recording_filename="experimentxx.h5", 
+        recording_filename="experiment_body.h5", 
         base_vel_command_type=args.vel_type
     )
 

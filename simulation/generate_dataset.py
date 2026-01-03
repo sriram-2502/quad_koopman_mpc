@@ -23,7 +23,7 @@ if __name__ == "__main__":
     storage_path = pathlib.Path(__file__).parent.parent / "datasets"
     data_path = run_simulation(
         qpympc_cfg=qpympc_cfg,
-        num_seconds_per_episode=50,
+        num_seconds_per_episode=10,
         num_episodes=1,
         ref_base_lin_vel=(-0.5, 0.5),
         ref_base_ang_vel=(-0.3, 0.3),

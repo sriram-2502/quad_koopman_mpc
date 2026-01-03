@@ -7,6 +7,7 @@ import pathlib
 from os import PathLike
 from pprint import pprint
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 # ---- Headless-safe defaults (must be set BEFORE mujoco/gym imports) ----
 # If you want a window, run with: RENDER=1 python simulation.py
@@ -49,9 +50,9 @@ def run_simulation(
     process=0,
     num_episodes=1,
     num_seconds_per_episode=10,
-    ref_base_lin_vel=(0.0, 2.0),
-    ref_base_ang_vel=(-0.4, 0.4),
-    friction_coeff=(1.0),
+    ref_base_lin_vel=(0.0, 0.5),
+    ref_base_ang_vel=(-0.2, 0.2),
+    friction_coeff=(0.5,1.0),
     base_vel_command_type="forward+rotate",  # "forward", "random", "forward+rotate", "human"
     seed=0,
     render=False,
@@ -168,7 +169,14 @@ def run_simulation(
     h5py_writer = H5Writer(
         file_path=dataset_path,
         env=env,
-        extra_obs={"nmpc_GRFs": (4, 3)},  # ctrl command; true GRFs are in state obs via contacts
+        extra_obs={
+            "nmpc_GRFs": (4, 3),           # ctrl command; true GRFs are in state obs via contacts
+            "base_lin_vel_body": (3,),     # body-frame linear velocity
+            "base_ang_vel_body": (3,),     # body-frame angular velocity
+            "gravity_body": (3,),          # gravity expressed in body frame
+            "cmd_base_lin_vel": (3,),      # commanded linear velocity (padded to 3)
+            "cmd_base_ang_vel": (3,),      # commanded angular velocity (padded to 3)
+        },
     )
     print(f"\nRecording data to: {dataset_path}")
 
@@ -186,6 +194,7 @@ def run_simulation(
         print(f"Episode {episode_num}: ref_lin_vel = {ref_base_lin_vel}, ref_ang_vel = {ref_base_ang_vel}")
 
         for _ in tqdm(range(N_STEPS_PER_EPISODE), desc=f"Ep:{episode_num:d}-steps:", total=N_STEPS_PER_EPISODE):
+            
             # Measurements ---------------------------------------------------------
             feet_pos = env.feet_pos(frame="world")
             feet_vel = env.feet_vel(frame="world")
@@ -195,6 +204,12 @@ def run_simulation(
             base_ori_euler_xyz = env.base_ori_euler_xyz
             base_pos = env.base_pos
             com_pos = env.com
+            
+            # Body-frame quantities for logging/ID (use current base orientation)
+            R_wb = R.from_euler("xyz", base_ori_euler_xyz).as_matrix()
+            base_lin_vel_body = env.base_lin_vel(frame="base")
+            base_ang_vel_body = env.base_ang_vel(frame="base")
+            gravity_body = R_wb.T @ np.array([0.0, 0.0, -qpympc_cfg.gravity_constant])
 
             ref_base_lin_vel, ref_base_ang_vel = env.target_base_vel()
 
@@ -259,6 +274,16 @@ def run_simulation(
             action[env.legs_tau_idx.RR] = tau.RR
 
             state, reward, is_terminated, is_truncated, info = env.step(action=action)
+            # Attach commanded base velocity references for logging
+            # Attach commanded base velocity references for logging (pad to 3D)
+            cmd_lin = np.zeros(3, float)
+            cmd_ang = np.zeros(3, float)
+            rblv = np.asarray(ref_base_lin_vel, float).ravel()
+            rba = np.asarray(ref_base_ang_vel, float).ravel()
+            cmd_lin[: min(3, rblv.size)] = rblv[: min(3, rblv.size)]
+            cmd_ang[: min(3, rba.size)] = rba[: min(3, rba.size)]
+            state["cmd_base_lin_vel"] = cmd_lin
+            state["cmd_base_ang_vel"] = cmd_ang
 
             # Controller observables ----------------------------------------------
             ctrl_state = quadrupedpympc_wrapper.get_obs()
@@ -275,6 +300,14 @@ def run_simulation(
                     axis=0,
                 )
                 state["nmpc_GRFs"] = grfs_array
+
+            # Add body-frame signals to the state dict for logging
+            if "base_lin_vel_body" not in state:
+                state["base_lin_vel_body"] = base_lin_vel_body
+            if "base_ang_vel_body" not in state:
+                state["base_ang_vel_body"] = base_ang_vel_body
+            if "gravity_body" not in state:
+                state["gravity_body"] = gravity_body
 
             ep_state_history.append(state)
             ep_time.append(env.simulation_time)
